@@ -191,8 +191,11 @@ MainController::MainController(QObject* parent)
     // §2.8 snapshot: fetchMyDevices/fetchFavorites are NOT needed here —
     // the WS `snapshot` frame replaces the local cache wholesale. We
     // still fetch connection logs (they don't stream over realtime).
-    // Device binding (autoBindDevice) happens after auth_ok (syncConnected).
+    // Device binding (autoBindDevice) happens after the realtime bootstrap
+    // snapshot/replay has completed (syncConnected). This makes the WS
+    // snapshot the authoritative baseline and avoids HTTP/WS ordering races.
     connect(m_authManager.get(), &AuthManager::loginSuccess, this, [this]() {
+        m_cloudSyncReady = false;
         m_cloudDeviceManager->startSync();
         m_cloudDeviceManager->fetchConnectionLogs();
         // syncAccessCode runs on deviceSecretReady (or hostReady), so it
@@ -202,22 +205,20 @@ MainController::MainController(QObject* parent)
     // Auth: on logout, stop sync. Logout's two-step flow (§2.11) already
     // cleared logged_in_intent and the user session server-side.
     connect(m_authManager.get(), &AuthManager::loggedOut, this, [this]() {
+        m_cloudSyncReady = false;
         m_cloudDeviceManager->stopSync();
     });
 
-    // syncConnected fires only after the WS has seen auth_ok (§2.8
-    // bootstrap). Safe to bind the device here — server has validated
-    // the token. autoBindDevice is idempotent; it also works on server-
-    // restart reconnects where Redis presence was wiped.
+    // syncConnected fires only after the WS has completed auth_ok plus
+    // snapshot/replay bootstrap. Binding after this point guarantees that
+    // the subsequent device.* event has a server_rev newer than the local
+    // baseline, so the client converges by ordered incremental patches.
     connect(m_cloudDeviceManager.get(), &CloudDeviceManager::syncConnected, this, [this]() {
-        if (!m_authManager->isLoggedIn()) return;
-        QString deviceId = m_hostManager->deviceId();
-        if (deviceId.isEmpty()) {
-            LOG_INFO("Sync connected but deviceId not ready yet, will bind on hostReady");
-            return;
-        }
-        LOG_INFO("Sync connected, binding device: {}", deviceId.toStdString());
-        m_cloudDeviceManager->autoBindDevice(deviceId);
+        m_cloudSyncReady = true;
+        bindHostDeviceIfReady("syncConnected");
+    });
+    connect(m_cloudDeviceManager.get(), &CloudDeviceManager::syncDisconnected, this, [this]() {
+        m_cloudSyncReady = false;
     });
 
     // Sync access code changes from cloud devices to recent connections
@@ -858,11 +859,7 @@ void MainController::onHostReady(const QString& deviceId, const QString& accessC
         emit deviceIdChanged();
         emit accessCodeChanged();
 
-        // Bind device if user is already logged in (syncConnected
-        // handler returned early if deviceId wasn't ready yet).
-        if (m_authManager->isLoggedIn() && !deviceId.isEmpty()) {
-            m_cloudDeviceManager->autoBindDevice(deviceId);
-        }
+        bindHostDeviceIfReady("hostReady");
         // §2.23: access_code upload uses Bearer device_secret and is
         // independent of user login state. HostManager::deviceSecretReady
         // handler in our constructor already triggers the initial
@@ -874,6 +871,23 @@ void MainController::onHostReady(const QString& deviceId, const QString& accessC
             m_cloudDeviceManager->syncAccessCode(deviceId, accessCode);
         }
     });
+}
+
+void MainController::bindHostDeviceIfReady(const char* reason)
+{
+    if (!m_authManager->isLoggedIn()) return;
+    if (!m_cloudSyncReady) {
+        LOG_INFO("Cloud sync not bootstrapped yet; defer host device bind ({})", reason);
+        return;
+    }
+    QString deviceId = m_hostManager->deviceId();
+    if (deviceId.isEmpty()) {
+        LOG_INFO("Host deviceId not ready yet; defer host device bind ({})", reason);
+        return;
+    }
+    LOG_INFO("Binding host device after ordered sync bootstrap (reason={}, device={})",
+             reason, deviceId.toStdString());
+    m_cloudDeviceManager->autoBindDevice(deviceId);
 }
 
 QString MainController::getDefaultServerUrl() const

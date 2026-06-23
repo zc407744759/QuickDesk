@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"errors"
@@ -13,18 +13,19 @@ import (
 )
 
 // DeviceHandler serves the user-scoped device surface under /v1/me/*:
-//   GET    /v1/me/devices
-//   POST   /v1/me/devices                    (bind/takeover)
-//   GET    /v1/me/devices/:device_id
-//   PATCH  /v1/me/devices/:device_id         (remark / device_name)
-//   DELETE /v1/me/devices/:device_id         (unbind)
-//   DELETE /v1/me/devices/:device_id/session (clear logged_in)
-//   GET    /v1/me/connections
-//   POST   /v1/me/connections
-//   GET    /v1/me/favorites
-//   POST   /v1/me/favorites
-//   PATCH  /v1/me/favorites/:device_id
-//   DELETE /v1/me/favorites/:device_id
+//
+//	GET    /v1/me/devices
+//	POST   /v1/me/devices                    (bind/takeover)
+//	GET    /v1/me/devices/:device_id
+//	PATCH  /v1/me/devices/:device_id         (remark / device_name)
+//	DELETE /v1/me/devices/:device_id         (unbind)
+//	DELETE /v1/me/devices/:device_id/session (clear logged_in)
+//	GET    /v1/me/connections
+//	POST   /v1/me/connections
+//	GET    /v1/me/favorites
+//	POST   /v1/me/favorites
+//	PATCH  /v1/me/favorites/:device_id
+//	DELETE /v1/me/favorites/:device_id
 //
 // All routes require middleware.UserAuth.Required(). Every mutation that
 // observers care about publishes an event through EventBus so the realtime
@@ -64,16 +65,16 @@ func NewDeviceHandler(
 // `online` and `logged_in` are derived from PresenceService at response
 // time; they are never persisted on the device row.
 type deviceItem struct {
-	DeviceID    string `json:"device_id"`
+	DeviceID   string `json:"device_id"`
 	DeviceName string `json:"device_name"`
-	Remark      string `json:"remark"`
-	Online      bool   `json:"online"`
-	LoggedIn    bool   `json:"logged_in"`
-	AccessCode  string `json:"access_code"`
-	OS          string `json:"os"`
-	OSVersion   string `json:"os_version"`
-	AppVersion  string `json:"app_version"`
-	LastSeenAt  string `json:"last_seen_at,omitempty"`
+	Remark     string `json:"remark"`
+	Online     bool   `json:"online"`
+	LoggedIn   bool   `json:"logged_in"`
+	AccessCode string `json:"access_code"`
+	OS         string `json:"os"`
+	OSVersion  string `json:"os_version"`
+	AppVersion string `json:"app_version"`
+	LastSeenAt string `json:"last_seen_at,omitempty"`
 }
 
 func (h *DeviceHandler) toDeviceItem(d *models.Device, remark string, online bool) deviceItem {
@@ -82,16 +83,16 @@ func (h *DeviceHandler) toDeviceItem(d *models.Device, remark string, online boo
 		lastSeen = d.LastSeenAt.UTC().Format("2006-01-02T15:04:05Z")
 	}
 	return deviceItem{
-		DeviceID:    d.DeviceID,
+		DeviceID:   d.DeviceID,
 		DeviceName: d.DeviceName,
-		Remark:      remark,
-		Online:      online,
-		LoggedIn:    d.LoggedIn && online,
-		AccessCode:  d.AccessCode,
-		OS:          d.OS,
-		OSVersion:   d.OSVersion,
-		AppVersion:  d.AppVersion,
-		LastSeenAt:  lastSeen,
+		Remark:     remark,
+		Online:     online,
+		LoggedIn:   d.LoggedIn && online,
+		AccessCode: d.AccessCode,
+		OS:         d.OS,
+		OSVersion:  d.OSVersion,
+		AppVersion: d.AppVersion,
+		LastSeenAt: lastSeen,
 	}
 }
 
@@ -195,8 +196,28 @@ func (h *DeviceHandler) Bind(c *gin.Context) {
 		return
 	}
 
-	// Event fan-out. Takeover 鈫?(ownership.lost to old owner) + (added to new).
-	// Plain bind (no takeover) 鈫?device.bound to new owner.
+	online := h.presence.IsOnline(c.Request.Context(), req.DeviceID)
+	var ud models.UserDevice
+	h.db.WithContext(c.Request.Context()).
+		Where("user_id = ? AND device_id = ?", uid, req.DeviceID).
+		First(&ud)
+	item := h.toDeviceItem(result.Device, ud.Remark, online)
+	deviceEventData := map[string]interface{}{
+		"device_id":    item.DeviceID,
+		"device_name":  item.DeviceName,
+		"remark":       item.Remark,
+		"online":       item.Online,
+		"logged_in":    item.LoggedIn,
+		"os":           item.OS,
+		"os_version":   item.OSVersion,
+		"app_version":  item.AppVersion,
+		"last_seen_at": item.LastSeenAt,
+	}
+
+	// Event fan-out. Takeover → (ownership.lost to old owner) + (added to new).
+	// Plain bind → device.bound to new owner. The new-owner event carries
+	// the non-secret DeviceItem fields so clients can converge via ordered
+	// WS patches without issuing a racing HTTP list fetch.
 	if result.PreviousOwner != nil {
 		h.bus.Publish(c.Request.Context(), service.Event{
 			Type:     service.EventDeviceOwnershipLost,
@@ -212,28 +233,30 @@ func (h *DeviceHandler) Bind(c *gin.Context) {
 				Type:     service.EventDeviceAdded,
 				UserID:   uid,
 				DeviceID: req.DeviceID,
-				Data: map[string]interface{}{
-					"device_id": req.DeviceID,
-				},
+				Data:     deviceEventData,
 			})
 		}
-	} else if !result.AlreadyOwned {
+	} else if result.AlreadyOwned {
 		h.bus.Publish(c.Request.Context(), service.Event{
-			Type:     service.EventDeviceBound,
+			Type:     service.EventDeviceSessionUpdated,
 			UserID:   uid,
 			DeviceID: req.DeviceID,
 			Data: map[string]interface{}{
 				"device_id": req.DeviceID,
+				"online":    item.Online,
+				"logged_in": item.LoggedIn,
 			},
+		})
+	} else {
+		h.bus.Publish(c.Request.Context(), service.Event{
+			Type:     service.EventDeviceBound,
+			UserID:   uid,
+			DeviceID: req.DeviceID,
+			Data:     deviceEventData,
 		})
 	}
 
-	online := h.presence.IsOnline(c.Request.Context(), req.DeviceID)
-	var ud models.UserDevice
-	h.db.WithContext(c.Request.Context()).
-		Where("user_id = ? AND device_id = ?", uid, req.DeviceID).
-		First(&ud)
-	c.JSON(http.StatusOK, h.toDeviceItem(result.Device, ud.Remark, online))
+	c.JSON(http.StatusOK, item)
 }
 
 // Unbind handles DELETE /v1/me/devices/:device_id.
@@ -279,7 +302,7 @@ func (h *DeviceHandler) ClearSession(c *gin.Context) {
 
 type patchDeviceReq struct {
 	DeviceName *string `json:"device_name"`
-	Remark      *string `json:"remark"`
+	Remark     *string `json:"remark"`
 }
 
 func (h *DeviceHandler) Patch(c *gin.Context) {
@@ -296,7 +319,7 @@ func (h *DeviceHandler) Patch(c *gin.Context) {
 	}
 	if err := h.devices.PatchMeta(c.Request.Context(), deviceID, uid, service.PatchMetaInput{
 		DeviceName: req.DeviceName,
-		Remark:      req.Remark,
+		Remark:     req.Remark,
 	}); err != nil {
 		h.writeDeviceErr(c, err)
 		return
@@ -307,7 +330,7 @@ func (h *DeviceHandler) Patch(c *gin.Context) {
 			UserID:   uid,
 			DeviceID: deviceID,
 			Data: map[string]interface{}{
-				"device_id":    deviceID,
+				"device_id":   deviceID,
 				"device_name": *req.DeviceName,
 			},
 		})

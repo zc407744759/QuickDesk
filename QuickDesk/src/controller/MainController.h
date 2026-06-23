@@ -278,6 +278,7 @@ private:
     // the transition into "connected" (e.g. after a network switch)
     // and re-bind the device to restore logged_in on the server.
     bool m_lastSignalingConnected = false;
+    bool m_cloudSyncReady = false;
     
     // Access code auto-refresh timer
     QTimer m_accessCodeRefreshTimer;
@@ -295,6 +296,7 @@ private:
     //   - Windows/Linux:  <executable dir>/skills
     QString getBuiltinSkillsDir() const;
     void setupWebSocketApiEvents();
+    void bindHostDeviceIfReady(const char* reason);
 
     // MCP HTTP process management
     void startMcpHttpProcess();

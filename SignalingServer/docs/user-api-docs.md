@@ -529,7 +529,8 @@ Handshake:
 2. Client sends:   {"type":"auth", "access_token":"...", "since_rev": 4217?}
 3. Server replies: {"type":"auth_ok", "server_rev": 4218}
 4. Server immediately sends a snapshot OR (if `since_rev` is recent enough)
-   replays missed events from Redis stream `qd:events:user:{user_id}`.
+  replays missed events from Redis stream `qd:events:user:{user_id}`.
+5. Server sends:  {"type":"bootstrap_done", "server_rev":4218}
 ```
 
 Snapshot frame:
@@ -547,12 +548,16 @@ Snapshot frame:
 
 Clients must **replace** local state on snapshot — never merge. Subsequent
 events with `device.*` / `favorite.*` types are patches and must be applied
-in-place; **clients must not refetch `/v1/me/devices` on every event** (anti-
-thundering-herd rule).
+in-place. Clients must apply snapshot/replay/events only when their
+`server_rev` is newer than the last applied revision; stale frames are ignored.
+Clients must not depend on HTTP `/v1/me/devices` responses to order or repair
+realtime state, because HTTP and WS frames can arrive in either order.
 
 If the gap is too large (Redis stream has been trimmed), the server replies
-`{type:"snapshot_required"}` and the client must re-send the auth frame to
-trigger a fresh snapshot.
+`{type:"snapshot_required"}` and then sends a fresh authoritative `snapshot`
+on the same connection. Clients may also choose to reconnect without
+`since_rev`, but they must remain compatible with the same-connection snapshot
+path.
 
 `session.revoked` events on this stream mean the user's session has been
 terminated by an admin (or family rotation detected a leak). Clients should

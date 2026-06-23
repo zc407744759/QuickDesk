@@ -82,27 +82,48 @@ void CloudDeviceManager::fetchMyDevices()
 {
     if (!m_authManager->isLoggedIn()) return;
 
+    qint64 requestRev = m_serverRev;
+
     QUrl url(httpBaseUrl() + "v1/me/devices");
 
     m_authManager->request("GET", url, QString(),
-        [this](int statusCode, const std::string& errorMsg, const std::string& data) {
-            QMetaObject::invokeMethod(this, [this, statusCode, errorMsg, data]() {
+        [this, requestRev](int statusCode, const std::string& errorMsg, const std::string& data) {
+            QMetaObject::invokeMethod(this, [this, statusCode, errorMsg, data, requestRev]() {
                 if (statusCode != 200 || !errorMsg.empty()) {
                     LOG_WARN("[CloudDeviceManager] fetchMyDevices failed: status={} err={}",
                              statusCode, errorMsg);
                     return;
                 }
+                if (m_syncBootstrapComplete && requestRev < m_lastAppliedRev) {
+                    LOG_INFO("[CloudDeviceManager] Ignoring stale fetchMyDevices response request_rev={} applied_rev={}",
+                             requestRev, m_lastAppliedRev);
+                    return;
+                }
                 QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(data));
                 QJsonArray devices = doc.object()["items"].toArray();
-                m_myDevices.clear();
+                QVariantList nextDevices;
                 for (const auto& v : devices) {
                     QJsonObject obj = v.toObject();
-                    m_myDevices.append(obj.toVariantMap());
+                    QString deviceId = obj["device_id"].toString();
+                    if (requestRev < deviceRev(deviceId)) {
+                        for (const auto& existing : m_myDevices) {
+                            QVariantMap existingRow = existing.toMap();
+                            if (existingRow["device_id"].toString() == deviceId) {
+                                nextDevices.append(existingRow);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    QVariantMap row = obj.toVariantMap();
+                    setDeviceRev(deviceId, requestRev);
+                    nextDevices.append(row);
                     LOG_INFO("[CloudDeviceManager]   device={} online={} logged_in={}",
-                             obj["device_id"].toString().toStdString(),
+                             deviceId.toStdString(),
                              obj["online"].toBool(),
                              obj["logged_in"].toBool());
                 }
+                m_myDevices = nextDevices;
                 LOG_INFO("[CloudDeviceManager] Fetched {} devices", m_myDevices.size());
                 emit myDevicesChanged();
             });
@@ -131,10 +152,11 @@ void CloudDeviceManager::autoBindDevice(const QString& deviceId)
                 }
                 LOG_INFO("[CloudDeviceManager] Device bound: {}",
                          deviceId.toStdString());
-                // The server will emit `device.bound` via realtime — no
-                // need to refetch; patch will arrive through the events WS.
-                // Fetch once as a belt-and-suspenders initial load.
-                fetchMyDevices();
+                // Authoritative list state converges through WS snapshot +
+                // server_rev-ordered device.* events. Do not issue an HTTP
+                // fetch here: its derived presence can be older than the
+                // queued realtime events and would reintroduce cross-channel
+                // ordering races.
             });
         });
 }
@@ -577,9 +599,17 @@ void CloudDeviceManager::removeFavorite(const QString& deviceId)
 void CloudDeviceManager::startSync()
 {
     if (!m_authManager->isLoggedIn()) return;
-    stopSync();
+    if (m_syncSocket) {
+        disconnect(m_syncSocket, nullptr, this, nullptr);
+        m_syncSocket->close();
+        m_syncSocket->deleteLater();
+        m_syncSocket = nullptr;
+        m_syncAuthOk = false;
+        m_syncBootstrapComplete = false;
+    }
 
     m_syncAuthOk = false;
+    m_syncBootstrapComplete = false;
     m_syncSocket = new QWebSocket(QString(),
                                     QWebSocketProtocol::VersionLatest, this);
     connect(m_syncSocket, &QWebSocket::textMessageReceived,
@@ -607,7 +637,10 @@ void CloudDeviceManager::stopSync()
         m_syncSocket->deleteLater();
         m_syncSocket = nullptr;
         m_syncAuthOk = false;
+        m_syncBootstrapComplete = false;
         m_serverRev = 0;
+        m_lastAppliedRev = 0;
+        m_deviceRevs.clear();
         LOG_INFO("[CloudDeviceManager] Realtime events WebSocket stopped");
     }
 }
@@ -627,14 +660,14 @@ void CloudDeviceManager::sendAuthFrame()
     QJsonObject auth;
     auth["type"] = "auth";
     auth["access_token"] = m_authManager->token();
-    if (m_serverRev > 0) {
+    if (m_lastAppliedRev > 0) {
         // §2.8 resume hint; server may reply with replay-then-snapshot or
         // snapshot_required depending on stream retention.
-        auth["since_rev"] = m_serverRev;
+        auth["since_rev"] = m_lastAppliedRev;
     }
     QString payload = QString::fromUtf8(QJsonDocument(auth).toJson(QJsonDocument::Compact));
     m_syncSocket->sendTextMessage(payload);
-    LOG_INFO("[CloudDeviceManager] Sent WS auth frame (since_rev={})", m_serverRev);
+    LOG_INFO("[CloudDeviceManager] Sent WS auth frame (since_rev={})", m_lastAppliedRev);
 }
 
 void CloudDeviceManager::onSyncTextMessageReceived(const QString& message)
@@ -644,10 +677,14 @@ void CloudDeviceManager::onSyncTextMessageReceived(const QString& message)
     QJsonObject msg = doc.object();
     QString type = msg["type"].toString();
 
-    // Track server_rev for resume on every wire frame that carries it.
+    qint64 frameRev = 0;
     if (msg.contains("server_rev")) {
-        qint64 rev = msg["server_rev"].toVariant().toLongLong();
-        if (rev > m_serverRev) m_serverRev = rev;
+        frameRev = msg["server_rev"].toVariant().toLongLong();
+    }
+
+    // Track server_rev for resume on every wire frame that carries it.
+    if (frameRev > 0) {
+        if (frameRev > m_serverRev) m_serverRev = frameRev;
     }
 
     LOG_DEBUG("[CloudDeviceManager] WS frame type={} server_rev={}",
@@ -655,9 +692,9 @@ void CloudDeviceManager::onSyncTextMessageReceived(const QString& message)
 
     if (type == "auth_ok") {
         m_syncAuthOk = true;
+        m_syncBootstrapComplete = false;
         m_reconnectAttempt = 0;
         LOG_INFO("[CloudDeviceManager] Realtime events auth_ok");
-        emit syncConnected();
         return;
     }
     if (type == "error") {
@@ -681,14 +718,32 @@ void CloudDeviceManager::onSyncTextMessageReceived(const QString& message)
         return;
     }
     if (type == "snapshot_required") {
-        LOG_INFO("[CloudDeviceManager] snapshot_required — waiting for snapshot frame");
-        // The server sends the snapshot frame next anyway; nothing to do.
+        LOG_INFO("[CloudDeviceManager] snapshot_required — waiting for full snapshot");
         return;
     }
     if (type == "snapshot") {
+        if (!shouldApplyWireFrame(type, frameRev)) return;
         handleSnapshotFrame(msg);
         return;
     }
+    if (type == "bootstrap_done") {
+        if (frameRev > m_lastAppliedRev) m_lastAppliedRev = frameRev;
+        m_syncBootstrapComplete = true;
+        LOG_INFO("[CloudDeviceManager] Realtime events bootstrap_done (server_rev={})", m_lastAppliedRev);
+        emit syncConnected();
+        return;
+    }
+    if (type == "session.revoked") {
+        if (frameRev <= m_lastAppliedRev) {
+            LOG_INFO("[CloudDeviceManager] Ignoring stale session.revoked rev={} applied_rev={}",
+                     frameRev, m_lastAppliedRev);
+            return;
+        }
+        m_lastAppliedRev = frameRev;
+        handleEventFrame(msg);
+        return;
+    }
+    if (!shouldApplyWireFrame(type, frameRev)) return;
     // Anything else is a domain event (§2.7).
     handleEventFrame(msg);
     emit syncMessage(msg);
@@ -698,6 +753,7 @@ void CloudDeviceManager::onSyncDisconnected()
 {
     bool wasAuthOk = m_syncAuthOk;
     m_syncAuthOk = false;
+    m_syncBootstrapComplete = false;
     int attempt = ++m_reconnectAttempt;
     int delayMs = qMin(kSyncReconnectBaseMs * (1 << qMin(attempt - 1, 5)),
                         kSyncReconnectMaxMs);
@@ -706,19 +762,52 @@ void CloudDeviceManager::onSyncDisconnected()
 
     LOG_WARN("[CloudDeviceManager] Realtime WS disconnected (was_auth_ok={}, attempt={}), reconnecting in {}ms",
              wasAuthOk, attempt, delayMs);
+    emit syncDisconnected();
     if (m_authManager->isLoggedIn()) {
         QTimer::singleShot(delayMs, this, &CloudDeviceManager::startSync);
     }
 }
 
+bool CloudDeviceManager::shouldApplyWireFrame(const QString& type, qint64 rev)
+{
+    if (rev <= 0) {
+        LOG_WARN("[CloudDeviceManager] Ignoring {} without server_rev", type.toStdString());
+        return false;
+    }
+    if (rev <= m_lastAppliedRev) {
+        LOG_INFO("[CloudDeviceManager] Ignoring stale {} rev={} applied_rev={}",
+                 type.toStdString(), rev, m_lastAppliedRev);
+        return false;
+    }
+    m_lastAppliedRev = rev;
+    return true;
+}
+
+void CloudDeviceManager::setDeviceRev(const QString& deviceId, qint64 rev)
+{
+    if (!deviceId.isEmpty() && rev > 0) {
+        m_deviceRevs[deviceId] = rev;
+    }
+}
+
+qint64 CloudDeviceManager::deviceRev(const QString& deviceId) const
+{
+    return m_deviceRevs.value(deviceId, 0);
+}
+
 void CloudDeviceManager::handleSnapshotFrame(const QJsonObject& msg)
 {
     QJsonObject data = msg["data"].toObject();
+    qint64 rev = msg["server_rev"].toVariant().toLongLong();
 
     QJsonArray devices = data["devices"].toArray();
     m_myDevices.clear();
+    m_deviceRevs.clear();
     for (const auto& v : devices) {
-        m_myDevices.append(v.toObject().toVariantMap());
+        QJsonObject obj = v.toObject();
+        QVariantMap row = obj.toVariantMap();
+        setDeviceRev(obj["device_id"].toString(), rev);
+        m_myDevices.append(row);
     }
     emit myDevicesChanged();
 
@@ -761,6 +850,7 @@ void CloudDeviceManager::applyDeviceEvent(const QString& type, const QJsonObject
 {
     QString deviceId = data["device_id"].toString();
     if (deviceId.isEmpty()) return;
+    qint64 rev = m_lastAppliedRev;
 
     // Find existing row (if any).
     int idx = -1;
@@ -776,37 +866,53 @@ void CloudDeviceManager::applyDeviceEvent(const QString& type, const QJsonObject
             m_myDevices.removeAt(idx);
             emit myDevicesChanged();
         }
+        setDeviceRev(deviceId, rev);
         return;
     }
     if (type == "device.bound" || type == "device.added") {
-        // Server sent minimal data ({device_id}); list fields will be
-        // filled in by a follow-up realtime event or the next snapshot.
-        // To keep the UI usable we insert a stub and schedule a fetch.
+        // Insert or patch from the event payload only. The snapshot is the
+        // authoritative full baseline; subsequent events are revision-ordered
+        // patches. Avoid HTTP refetch here so cross-channel ordering cannot
+        // reintroduce stale online/offline state.
         if (idx < 0) {
             QVariantMap stub;
             stub["device_id"] = deviceId;
-            // Copy whatever extra fields are in the event (may include
-            // device_name / os / logged_in depending on future server changes).
             for (auto it = data.constBegin(); it != data.constEnd(); ++it) {
                 stub[it.key()] = it.value().toVariant();
             }
+            setDeviceRev(deviceId, rev);
             m_myDevices.append(stub);
             emit myDevicesChanged();
-            // Fetch to get access_code / remark / display_name — these
-            // aren't in the event payload for privacy reasons.
-            fetchMyDevices();
+        } else {
+            QVariantMap row = m_myDevices[idx].toMap();
+            if (rev <= deviceRev(deviceId)) return;
+            for (auto it = data.constBegin(); it != data.constEnd(); ++it) {
+                row[it.key()] = it.value().toVariant();
+            }
+            setDeviceRev(deviceId, rev);
+            m_myDevices[idx] = row;
+            emit myDevicesChanged();
         }
         return;
     }
     // For update events, patch selected fields on the existing row.
     if (idx < 0) {
-        // Event for a device we don't know about — request a fetch to
-        // reconcile (rare, happens on races where snapshot missed a row).
-        fetchMyDevices();
+        // A revision-ordered event for a device missing from the local
+        // cache can happen when a minimal event follows a replay/snapshot
+        // boundary. Insert a sparse row and let later patch/snapshot fill it.
+        QVariantMap stub;
+        stub["device_id"] = deviceId;
+        for (auto it = data.constBegin(); it != data.constEnd(); ++it) {
+            stub[it.key()] = it.value().toVariant();
+        }
+        setDeviceRev(deviceId, rev);
+        m_myDevices.append(stub);
+        emit myDevicesChanged();
         return;
     }
 
     QVariantMap row = m_myDevices[idx].toMap();
+    if (rev <= deviceRev(deviceId)) return;
     bool changed = false;
     auto copyField = [&](const QString& key) {
         if (data.contains(key)) {
@@ -831,12 +937,11 @@ void CloudDeviceManager::applyDeviceEvent(const QString& type, const QJsonObject
         copyField("logged_in");
         copyField("online");
     } else if (type == "device.access_code.changed") {
-        // §2.16: event data does NOT carry plaintext access_code.
-        // syncAccessCode's local patch already updated the field; if we
-        // got here without having done the PUT ourselves (e.g. another
-        // Qt instance updated it), refetch to learn the new code.
-        fetchMyDevices();
-        return;
+        // §2.16: event data does NOT carry plaintext access_code. The
+        // device row revision still advances so older HTTP/snapshot data
+        // cannot overwrite newer online/offline state. The actual code is
+        // patched locally by syncAccessCode when this Qt instance uploads it.
+        changed = true;
     } else if (type == "device.remark.changed") {
         copyField("remark");
     } else if (type == "device.device_name.changed") {
@@ -851,6 +956,7 @@ void CloudDeviceManager::applyDeviceEvent(const QString& type, const QJsonObject
     }
 
     if (changed) {
+        setDeviceRev(deviceId, rev);
         m_myDevices[idx] = row;
         emit myDevicesChanged();
     }

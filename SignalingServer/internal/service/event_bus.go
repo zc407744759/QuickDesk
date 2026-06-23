@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"context"
@@ -42,7 +42,7 @@ const (
 	EventDeviceSessionUpdated    = "device.session.updated"
 	EventDeviceAccessCodeChanged = "device.access_code.changed"
 	EventDeviceRemarkChanged     = "device.remark.changed"
-	EventDeviceNameChanged   = "device.device_name.changed"
+	EventDeviceNameChanged       = "device.device_name.changed"
 	EventDeviceSecretRotated     = "device.secret.rotated"
 
 	EventFavoriteAdded   = "favorite.added"
@@ -55,8 +55,8 @@ const (
 
 // EventSubscriber is the in-process interface for anything that wants to
 // react to events (real-time WS push, webhook dispatcher, audit log,
-// connection-history writer). Each subscriber runs in its own goroutine
-// and MUST NOT block indefinitely.
+// connection-history writer). Subscribers are invoked through EventBus'
+// bounded worker queue and MUST NOT block indefinitely.
 type EventSubscriber interface {
 	HandleEvent(ctx context.Context, evt Event)
 	Name() string
@@ -68,6 +68,7 @@ type EventSubscriber interface {
 type EventBus struct {
 	rdb       *redis.Client
 	mu        sync.RWMutex
+	publishMu sync.Mutex
 	subs      []EventSubscriber
 	stream    time.Duration // stream retention (TTL hint; actual MAXLEN handles size)
 	workQueue chan subscriberWork
@@ -82,9 +83,7 @@ type subscriberWork struct {
 // is primarily capped by XADD MAXLEN.
 func NewEventBus(rdb *redis.Client) *EventBus {
 	b := &EventBus{rdb: rdb, stream: 5 * time.Minute, workQueue: make(chan subscriberWork, 1024)}
-	for i := 0; i < 4; i++ {
-		go b.subscriberWorker()
-	}
+	go b.subscriberWorker()
 	return b
 }
 
@@ -102,16 +101,15 @@ func (b *EventBus) subscriberWorker() {
 }
 
 // Subscribe adds an in-process subscriber. Order of registration determines
-// the order of fan-out (though each subscriber runs in its own goroutine,
-// so timing is not guaranteed).
+// fan-out order. EventBus uses a single worker so all subscribers observe
+// events in the same order as EventBus.Publish stamped server_rev.
 func (b *EventBus) Subscribe(s EventSubscriber) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.subs = append(b.subs, s)
 }
 
-// Publish fans out the event to every subscriber (each in its own goroutine
-// with panic recovery) and, when UserID is non-zero, appends it to the
+// Publish enqueues the event for in-process subscribers and, when UserID is non-zero, appends it to the
 // per-user Redis stream that powers realtime resume/snapshot recovery.
 //
 // NOTE: Callers must Publish *after* the DB transaction that produced the
@@ -121,6 +119,9 @@ func (b *EventBus) Subscribe(s EventSubscriber) {
 // outbox table; the §2.8 snapshot-on-reconnect path is authoritative and
 // self-heals any lost delta).
 func (b *EventBus) Publish(ctx context.Context, evt Event) {
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
+
 	if evt.ID == "" {
 		evt.ID = "evt_" + uuid.New().String()
 	}

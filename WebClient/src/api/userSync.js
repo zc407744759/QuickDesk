@@ -5,7 +5,8 @@
 //   server → {type:"auth_ok", server_rev}
 //   server → {type:"snapshot", server_rev, data:{devices, favorites}}  (or a
 //            stream of replay events when resume succeeds)
-//   server → increments of {type:"device.*"/"favorite.*"/"session.revoked"}
+//   server → {type:"bootstrap_done", server_rev}
+//   server → increments of {type:"device.*"/"favorite.*"/"session.revoked", server_rev}
 //
 // The transport maintains:
 //   • server_rev so reconnects can send {since_rev} (§2.8 resume)
@@ -50,11 +51,13 @@ class UserSync extends EventTarget {
     this._authOk = false
     this._attempt = 0
     this._serverRev = 0
+    this._lastAppliedRev = 0
 
     // Local mirrors — consumers read via getDevices()/getFavorites() or
     // listen to 'snapshot' / 'patch' events.
     this._devices   = []
     this._favorites = []
+    this._deviceRevs = new Map()
   }
 
   start() {
@@ -76,8 +79,10 @@ class UserSync extends EventTarget {
     // Reset server_rev so a fresh login gets a full snapshot (not a resume
     // against a stale rev from a previous session).
     this._serverRev = 0
+    this._lastAppliedRev = 0
     this._devices = []
     this._favorites = []
+    this._deviceRevs.clear()
   }
 
   // Read-only accessors the views bind to.
@@ -120,7 +125,7 @@ class UserSync extends EventTarget {
     const token = userApi.getToken()
     if (!token) { try { this._ws.close() } catch { /* noop */ } return }
     const frame = { type: 'auth', access_token: token }
-    if (this._serverRev > 0) frame.since_rev = this._serverRev
+    if (this._lastAppliedRev > 0) frame.since_rev = this._lastAppliedRev
     try { this._ws.send(JSON.stringify(frame)) }
     catch { /* next onclose handles reconnect */ }
   }
@@ -154,7 +159,6 @@ class UserSync extends EventTarget {
     if (type === 'auth_ok') {
       this._authOk = true
       this._attempt = 0
-      this.dispatchEvent(new CustomEvent('connected', { detail: { server_rev: this._serverRev } }))
       return
     }
 
@@ -172,25 +176,27 @@ class UserSync extends EventTarget {
     }
 
     if (type === 'snapshot_required') {
-      // Next frame is the snapshot; just wait for it.
+      // We cannot prove a clean replay. The server keeps the connection
+      // open and sends a full snapshot next for backwards compatibility
+      // with older clients that treat this frame as a hint.
       return
     }
 
     if (type === 'snapshot') {
+      if (!this._shouldApplyFrame(type, msg.server_rev)) return
       this._applySnapshot(msg)
       return
     }
 
-    // Domain events — patch local state and notify.
-    if (DEVICE_EVENT_TYPES.includes(type)) {
-      this._applyDeviceEvent(type, msg.data || {})
-      return
-    }
-    if (FAVORITE_EVENT_TYPES.includes(type)) {
-      this._applyFavoriteEvent(type, msg.data || {})
+    if (type === 'bootstrap_done') {
+      if (typeof msg.server_rev === 'number' && msg.server_rev > this._lastAppliedRev) {
+        this._lastAppliedRev = msg.server_rev
+      }
+      this.dispatchEvent(new CustomEvent('connected', { detail: { server_rev: this._serverRev } }))
       return
     }
     if (type === 'session.revoked') {
+      if (!this._shouldApplyFrame(type, msg.server_rev)) return
       // §2.17 / T9: current access_token was revoked server-side.
       // Behaviour parity with Qt (CloudDeviceManager.cpp:652 logs this
       // and calls AuthManager::logout which runs the two-step flow).
@@ -204,15 +210,37 @@ class UserSync extends EventTarget {
       userApi.handleServerRevoked()
       return
     }
+
+    if (!this._shouldApplyFrame(type, msg.server_rev)) return
+
+    // Domain events — patch local state and notify.
+    if (DEVICE_EVENT_TYPES.includes(type)) {
+      this._applyDeviceEvent(type, msg.data || {})
+      return
+    }
+    if (FAVORITE_EVENT_TYPES.includes(type)) {
+      this._applyFavoriteEvent(type, msg.data || {})
+      return
+    }
   }
 
   // ----- snapshot / patch helpers ----------------------------------------
 
+  _shouldApplyFrame(type, rev) {
+    if (typeof rev !== 'number' || rev <= 0) return false
+    if (rev <= this._lastAppliedRev) return false
+    this._lastAppliedRev = rev
+    return true
+  }
+
   _applySnapshot(msg) {
     // T7: snapshot fully REPLACES local arrays.
     const data = msg.data || {}
+    const rev = msg.server_rev || this._lastAppliedRev
     this._devices   = Array.isArray(data.devices)   ? data.devices.slice()   : []
     this._favorites = Array.isArray(data.favorites) ? data.favorites.slice() : []
+    this._deviceRevs.clear()
+    this._devices.forEach(d => { if (d && d.device_id) this._deviceRevs.set(d.device_id, rev) })
     this.dispatchEvent(new CustomEvent('snapshot', {
       detail: { devices: this._devices, favorites: this._favorites, server_rev: this._serverRev },
     }))
@@ -225,33 +253,40 @@ class UserSync extends EventTarget {
     return this._favorites.findIndex(f => f && f.device_id === deviceId)
   }
 
-  // T8: patch local arrays, do NOT refetch on ordinary updates. Only
-  // exceptions are `device.bound`/`device.added` with minimal payload
-  // and `device.access_code.changed` (payload has no plaintext).
+  // T8: patch local arrays, do NOT refetch on ordinary updates. The
+  // server_rev gate above makes snapshot/replay/event ordering authoritative.
   _applyDeviceEvent(type, data) {
     const deviceId = data.device_id
     if (!deviceId) return
     const idx = this._findDeviceIdx(deviceId)
+    const rev = this._lastAppliedRev
+    const currentRev = this._deviceRevs.get(deviceId) || 0
     let dirty = false
 
     if (type === 'device.unbound' || type === 'device.ownership.lost') {
       if (idx >= 0) { this._devices.splice(idx, 1); dirty = true }
+      this._deviceRevs.set(deviceId, rev)
     } else if (type === 'device.bound' || type === 'device.added') {
       if (idx < 0) {
-        // Seed a stub with whatever fields the event carries; refetch
-        // to fill access_code / remark / display_name (not in payload).
         this._devices.push({ ...data })
+        this._deviceRevs.set(deviceId, rev)
         dirty = true
-        this._requestRefetch()
+      } else if (rev > currentRev) {
+        this._devices[idx] = { ...this._devices[idx], ...data }
+        this._deviceRevs.set(deviceId, rev)
+        dirty = true
       }
     } else if (type === 'device.access_code.changed') {
-      // Payload carries no plaintext — refetch to learn the new code.
-      this._requestRefetch()
+      if (idx >= 0 && rev > currentRev) {
+        this._deviceRevs.set(deviceId, rev)
+        dirty = true
+      }
     } else {
       if (idx < 0) {
-        // Event for a device we don't know — reconcile.
-        this._requestRefetch()
-      } else {
+        this._devices.push({ ...data })
+        this._deviceRevs.set(deviceId, rev)
+        dirty = true
+      } else if (rev > currentRev) {
         const row = { ...this._devices[idx] }
         const copyField = (k) => {
           if (Object.prototype.hasOwnProperty.call(data, k)) {
@@ -263,8 +298,6 @@ class UserSync extends EventTarget {
           if (Object.prototype.hasOwnProperty.call(data, 'logged_in')) {
             copyField('logged_in')
           } else if (Object.prototype.hasOwnProperty.call(data, 'online')) {
-            // logged_in derived = logged_in_intent && online; keep intent
-            // via existing value and recompute.
             row.logged_in = !!(data.online && row.logged_in)
             dirty = true
           }
@@ -274,8 +307,13 @@ class UserSync extends EventTarget {
           copyField('remark')
         } else if (type === 'device.device_name.changed') {
           copyField('device_name')
+        } else if (type === 'device.secret.rotated') {
+          dirty = true
         }
-        if (dirty) this._devices[idx] = row
+        if (dirty) {
+          this._devices[idx] = row
+          this._deviceRevs.set(deviceId, rev)
+        }
       }
     }
 
@@ -307,22 +345,6 @@ class UserSync extends EventTarget {
         detail: { favorites: this.getFavorites(), type, data },
       }))
     }
-  }
-
-  // Debounced refetch used by the bound/added/access_code.changed paths.
-  _requestRefetch() {
-    if (this._refetchPending) return
-    this._refetchPending = true
-    setTimeout(async () => {
-      this._refetchPending = false
-      const r = await userApi.fetchMyDevices()
-      if (r.ok && r.data && Array.isArray(r.data.items)) {
-        this._devices = r.data.items.slice()
-        this.dispatchEvent(new CustomEvent('devices-changed', {
-          detail: { devices: this.getDevices(), type: 'refetch', data: null },
-        }))
-      }
-    }, 100)
   }
 }
 

@@ -6,6 +6,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QHash>
 #include <QVariantList>
 #include <QWebSocket>
 
@@ -106,9 +107,12 @@ signals:
     void connectionLogsChanged();
     void syncMessage(const QJsonObject& msg);
     // syncConnected fires when the realtime events WS has finished its
-    // first-frame auth_ok handshake AND received the initial snapshot.
-    // Subscribers (MainController.autoBindDevice) can now safely act.
+    // first-frame auth_ok handshake AND completed snapshot/replay
+    // bootstrap. Subscribers (MainController.autoBindDevice) can now
+    // safely act; subsequent device.* events are newer than the local
+    // baseline and are applied by server_rev.
     void syncConnected();
+    void syncDisconnected();
 
 private slots:
     void onSyncTextMessageReceived(const QString& message);
@@ -126,6 +130,9 @@ private:
     void applyDeviceEvent(const QString& type, const QJsonObject& data);
     void applyFavoriteEvent(const QString& type, const QJsonObject& data);
     void sendAuthFrame();
+    bool shouldApplyWireFrame(const QString& type, qint64 rev);
+    void setDeviceRev(const QString& deviceId, qint64 rev);
+    qint64 deviceRev(const QString& deviceId) const;
 
     ServerManager* m_serverManager;
     AuthManager*   m_authManager;
@@ -133,12 +140,15 @@ private:
 
     QWebSocket* m_syncSocket = nullptr;
     bool m_syncAuthOk = false;
+    bool m_syncBootstrapComplete = false;
     qint64 m_serverRev = 0;
+    qint64 m_lastAppliedRev = 0;
     int m_reconnectAttempt = 0;
 
     QVariantList m_myDevices;
     QVariantList m_myFavorites;
     QVariantList m_connectionLogs;
+    QHash<QString, qint64> m_deviceRevs;
 
     // De-dup guard for syncAccessCode (R28): three MainController
     // listeners (hostReady / accessCodeChanged / deviceSecretReady) can

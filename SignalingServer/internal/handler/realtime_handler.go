@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"context"
@@ -22,16 +22,16 @@ import (
 
 // RealtimeHandler owns the two WebSocket endpoints:
 //
-//   GET /v1/realtime/events  鈥?per-user push stream of device.*, favorite.*,
-//                              session.revoked, etc. First client frame is
-//                              auth; first server frame is auth_ok + snapshot.
-//                              Supports {type:"resume", since_rev:N}.
+//	GET /v1/realtime/events  鈥?per-user push stream of device.*, favorite.*,
+//	                           session.revoked, etc. First client frame is
+//	                           auth; first server frame is auth_ok + snapshot.
+//	                           Supports {type:"resume", since_rev:N}.
 //
-//   GET /v1/realtime/signal  鈥?generic signaling WebSocket. First frame
-//                              supplies a single-use signal_token plus role
-//                              (host / client) and device_id. Messages after
-//                              auth_ok are jingle (SDP / ICE) passed opaquely
-//                              between host and clients of the same device.
+//	GET /v1/realtime/signal  鈥?generic signaling WebSocket. First frame
+//	                           supplies a single-use signal_token plus role
+//	                           (host / client) and device_id. Messages after
+//	                           auth_ok are jingle (SDP / ICE) passed opaquely
+//	                           between host and clients of the same device.
 //
 // All upgrades happen without any auth in the URL 鈥?all tokens live in the
 // first frame (搂2.13).
@@ -246,11 +246,16 @@ func (h *RealtimeHandler) HandleEvents(c *gin.Context) {
 		done:     make(chan struct{}),
 	}
 
-	// §2.8 requires the bootstrap sequence (auth_ok → snapshot → replay)
-	// to be *contiguous* — no concurrent event may be interleaved. We
-	// therefore send the bootstrap synchronously BEFORE registering this
-	// conn with the bus fanout. Bus Publish can't find us yet, so it
-	// can't race us into writing a mid-stream event before snapshot.
+	// §2.8 requires the bootstrap sequence (auth_ok → snapshot/replay →
+	// bootstrap_done) to be contiguous on the wire while still not losing
+	// events published during the bootstrap window. Register the connection
+	// before we build the snapshot so live events are queued in ec.out, but
+	// do not start the writer until after bootstrap_done has been written.
+	// The writer then drains queued live events strictly after the bootstrap
+	// baseline, and clients use server_rev to ignore stale queued events.
+	h.registerEventConn(ec)
+	defer h.unregisterEventConn(ec)
+
 	rev := h.nextRev()
 	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 	if err := conn.WriteJSON(eventWire{Type: "auth_ok", ServerRev: rev}); err != nil {
@@ -266,37 +271,48 @@ func (h *RealtimeHandler) HandleEvents(c *gin.Context) {
 		if r, err := h.bus.EventsSinceRev(c.Request.Context(), uid, af.SinceRev); err == nil && !r.Truncated {
 			for _, e := range r.Events {
 				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-				_ = conn.WriteJSON(eventWire{
+				if err := conn.WriteJSON(eventWire{
 					ID:        e.ID,
 					Type:      e.Type,
 					Ts:        e.Ts,
 					ServerRev: e.ServerRev,
 					Data:      e.Data,
-				})
+				}); err != nil {
+					return
+				}
 			}
 			resumed = true
 		} else {
-			// Either the stream was trimmed past the caller's
-			// checkpoint or the lookup failed; both mean "we cannot
-			// guarantee a clean replay" → fall through to the full
-			// snapshot path with an explicit hint frame.
+			// Either the stream was trimmed past the caller's checkpoint
+			// or the lookup failed; both mean "we cannot guarantee a clean
+			// replay". For backwards compatibility, snapshot_required is
+			// only a hint frame: old clients ignore it and wait for the
+			// full snapshot that follows; new clients may also choose to
+			// keep this connection and accept the snapshot baseline.
 			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-			_ = conn.WriteJSON(eventWire{Type: "snapshot_required", ServerRev: rev})
+			if err := conn.WriteJSON(eventWire{Type: "snapshot_required", ServerRev: rev}); err != nil {
+				return
+			}
 		}
 	}
 	if !resumed {
 		snap, err := h.buildSnapshot(c.Request.Context(), uid)
-		if err == nil {
-			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-			_ = conn.WriteJSON(eventWire{Type: "snapshot", ServerRev: rev, Data: snap})
+		if err != nil {
+			log.Printf("[realtime/events] build snapshot failed user=%d: %v", uid, err)
+			return
+		}
+		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		if err := conn.WriteJSON(eventWire{Type: "snapshot", ServerRev: rev, Data: snap}); err != nil {
+			return
 		}
 	}
+	conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	if err := conn.WriteJSON(eventWire{Type: "bootstrap_done", ServerRev: rev}); err != nil {
+		return
+	}
 
-	// Now that the bootstrap is fully flushed, make this conn visible to
-	// the bus fanout and start the ping/read loops.
-	h.registerEventConn(ec)
-	defer h.unregisterEventConn(ec)
-
+	// Now that the bootstrap is fully flushed, drain any events that were
+	// queued while snapshot/replay was being written and start ping/read.
 	go ec.writer()
 	ec.reader()
 }
@@ -330,9 +346,11 @@ func (ec *eventConn) send(w eventWire) {
 	select {
 	case ec.out <- w:
 	default:
-		// Drop on overflow; client will have to reconnect + resume. This
-		// is preferable to blocking the bus fanout goroutine.
+		// Never silently drop ordered state events: if the queue overflows,
+		// close the connection so the client reconnects and rebuilds from
+		// replay/snapshot instead of converging on a partial event stream.
 		log.Printf("[realtime/events] send queue overflow user=%d", ec.userID)
+		ec.close()
 	}
 }
 
@@ -344,6 +362,11 @@ func (ec *eventConn) writer() {
 		case <-ec.done:
 			return
 		case w := <-ec.out:
+			select {
+			case <-ec.done:
+				return
+			default:
+			}
 			ec.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := ec.conn.WriteJSON(w); err != nil {
 				ec.close()
@@ -439,7 +462,7 @@ func (h *RealtimeHandler) buildSnapshot(ctx context.Context, userID uint) (map[s
 		}
 		deviceItems = append(deviceItems, map[string]interface{}{
 			"device_id":    d.DeviceID,
-			"device_name": d.DeviceName,
+			"device_name":  d.DeviceName,
 			"remark":       remarks[d.DeviceID],
 			"online":       online[d.DeviceID],
 			"logged_in":    d.LoggedIn && online[d.DeviceID],
@@ -746,8 +769,9 @@ func (sc *signalConn) close() {
 }
 
 // routeSignalMessage forwards a frame based on direction + client_id.
-//   host 鈫?server: expect {client_id:...} in payload, route to that client.
-//   client 鈫?server: always route to the host for this device.
+//
+//	host 鈫?server: expect {client_id:...} in payload, route to that client.
+//	client 鈫?server: always route to the host for this device.
 func (h *RealtimeHandler) routeSignalMessage(from *signalConn, raw []byte) {
 	switch from.role {
 	case service.SignalRoleHost:
