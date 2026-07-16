@@ -136,12 +136,12 @@ public:
     Q_INVOKABLE bool supportsVirtualDisplay(const QString& deviceId) const;
 
     // File transfer (Client -> Host upload)
-    Q_INVOKABLE void startFileUpload(const QString& deviceId, const QUrl& fileUrl);
+    Q_INVOKABLE bool startFileUpload(const QString& deviceId, const QUrl& fileUrl);
     Q_INVOKABLE void cancelFileUpload(const QString& deviceId, const QString& transferId);
     Q_INVOKABLE bool supportsFileTransfer(const QString& deviceId) const;
 
     // File download (Host -> Client)
-    Q_INVOKABLE void startFileDownload(const QString& deviceId);
+    Q_INVOKABLE bool startFileDownload(const QString& deviceId);
     Q_INVOKABLE void cancelFileDownload(const QString& deviceId, const QString& transferId);
 
     // Downloaded file operations

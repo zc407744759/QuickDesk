@@ -418,21 +418,11 @@ Window {
                         onFilesDropped: function(urls) {
                             var devId = delegateItem.deviceId
                             if (!devId || !remoteWindow.clientManager) return
+                            var anyStarted = false
                             for (var i = 0; i < urls.length; i++) {
-                                remoteWindow.clientManager.startFileUpload(devId, urls[i])
-                                var fname = urls[i].toString().split('/').pop()
-                                transferModel.append({
-                                    transferId: "",
-                                    deviceId: devId,
-                                    filename: decodeURIComponent(fname),
-                                    progress: 0,
-                                    status: "uploading",
-                                    errorMessage: "",
-                                    direction: "upload",
-                                    savePath: ""
-                                })
+                                anyStarted = remoteWindow.startUploadAndTrack(devId, urls[i]) || anyStarted
                             }
-                            fileTransferDrawer.open()
+                            if (anyStarted) fileTransferDrawer.open()
                         }
 
                         // Monitor video size changes (frameRate and ping updated from PerformanceTracker)
@@ -801,21 +791,11 @@ Window {
             var devId = currentTabIndex >= 0 && currentTabIndex < connectionModel.count
                 ? connectionModel.deviceIdAt(currentTabIndex) : ""
             if (devId && remoteWindow.clientManager) {
+                var anyStarted = false
                 for (var i = 0; i < selectedFiles.length; i++) {
-                    remoteWindow.clientManager.startFileUpload(devId, selectedFiles[i])
-                    var fname = selectedFiles[i].toString().split('/').pop()
-                    transferModel.append({
-                        transferId: "",
-                        deviceId: devId,
-                        filename: decodeURIComponent(fname),
-                        progress: 0,
-                        status: "uploading",
-                        errorMessage: "",
-                        direction: "upload",
-                        savePath: ""
-                    })
+                    anyStarted = remoteWindow.startUploadAndTrack(devId, selectedFiles[i]) || anyStarted
                 }
-                fileTransferDrawer.open()
+                if (anyStarted) fileTransferDrawer.open()
             }
         }
     }
@@ -847,6 +827,31 @@ Window {
             if (item.filename === filename && item.transferId === "") return i
         }
         return -1
+    }
+
+    function filenameFromUrl(fileUrl) {
+        var raw = fileUrl ? fileUrl.toString() : ""
+        var parts = raw.split("/")
+        return decodeURIComponent(parts.length > 0 ? parts[parts.length - 1] : raw)
+    }
+
+    function startUploadAndTrack(deviceId, fileUrl) {
+        if (!deviceId || !remoteWindow.clientManager) return false
+        if (!remoteWindow.clientManager.startFileUpload(deviceId, fileUrl)) {
+            return false
+        }
+
+        transferModel.append({
+            transferId: "",
+            deviceId: deviceId,
+            filename: remoteWindow.filenameFromUrl(fileUrl),
+            progress: 0,
+            status: "uploading",
+            errorMessage: "",
+            direction: "upload",
+            savePath: ""
+        })
+        return true
     }
 
     // File transfer event handlers

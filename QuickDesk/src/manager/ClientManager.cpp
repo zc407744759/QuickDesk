@@ -16,10 +16,58 @@
 #include <QDesktopServices>
 #include <QGuiApplication>
 #include <QMimeData>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QUrl>
 
 namespace quickdesk {
+
+namespace {
+
+QString describeFileTransferError(const QString& errorMessage)
+{
+    static const QRegularExpression typePattern(QStringLiteral("type=(\\d+)"));
+    const QRegularExpressionMatch match = typePattern.match(errorMessage);
+    if (!match.hasMatch()) {
+        return errorMessage;
+    }
+
+    const int type = match.captured(1).toInt();
+    QString description;
+    switch (type) {
+    case 0:
+        description = QObject::tr("Unspecified file transfer error");
+        break;
+    case 1:
+        description = QObject::tr("File transfer cancelled");
+        break;
+    case 2:
+        description = QObject::tr("Remote host failed to save the file unexpectedly. Check the remote host log for details.");
+        break;
+    case 3:
+        description = QObject::tr("File transfer protocol error");
+        break;
+    case 4:
+        description = QObject::tr("Remote host denied permission to save the file");
+        break;
+    case 5:
+        description = QObject::tr("Remote host is out of disk space");
+        break;
+    case 6:
+        description = QObject::tr("Remote host I/O error while saving the file");
+        break;
+    case 7:
+        description = QObject::tr("Remote host is not logged in");
+        break;
+    default:
+        description = QObject::tr("Unknown file transfer error");
+        break;
+    }
+
+    return QStringLiteral("%1 (%2)").arg(description, errorMessage);
+}
+
+} // namespace
 
 ClientManager::ClientManager(QObject* parent)
     : QObject(parent)
@@ -549,16 +597,56 @@ bool ClientManager::supportsVirtualDisplay(const QString& deviceId) const
     return it.value().supportsVirtualDisplay;
 }
 
-void ClientManager::startFileUpload(const QString& deviceId, const QUrl& fileUrl)
+bool ClientManager::startFileUpload(const QString& deviceId, const QUrl& fileUrl)
 {
     if (!m_messaging || !m_messaging->isReady()) {
         LOG_WARN("Cannot start file upload: messaging not ready");
-        return;
+        emit fileTransferError(deviceId, QString(), tr("Client process is not ready"));
+        return false;
     }
     QString connId = connectionIdFor(deviceId);
-    if (connId.isEmpty()) return;
+    if (connId.isEmpty()) {
+        LOG_WARN("Cannot start file upload: no connection for device {}",
+                 deviceId.toStdString());
+        emit fileTransferError(deviceId, QString(), tr("Remote connection is not ready"));
+        return false;
+    }
+
+    if (!supportsFileTransfer(deviceId)) {
+        LOG_WARN("Cannot start file upload: host does not support file transfer, device={}",
+                 deviceId.toStdString());
+        emit fileTransferError(deviceId, QString(), tr("Remote host does not support file transfer"));
+        return false;
+    }
+
+    if (!fileUrl.isLocalFile()) {
+        LOG_WARN("Cannot start file upload: URL is not a local file: {}",
+                 fileUrl.toString().toStdString());
+        emit fileTransferError(deviceId, QString(), tr("Only local files can be uploaded"));
+        return false;
+    }
 
     QString filePath = fileUrl.toLocalFile();
+    QFileInfo fileInfo(filePath);
+    if (filePath.isEmpty() || !fileInfo.exists()) {
+        LOG_WARN("Cannot start file upload: file does not exist: {}",
+                 filePath.toStdString());
+        emit fileTransferError(deviceId, QString(), tr("File does not exist"));
+        return false;
+    }
+    if (!fileInfo.isFile()) {
+        LOG_WARN("Cannot start file upload: path is not a regular file: {}",
+                 filePath.toStdString());
+        emit fileTransferError(deviceId, QString(), tr("Only files can be uploaded"));
+        return false;
+    }
+    if (!fileInfo.isReadable()) {
+        LOG_WARN("Cannot start file upload: file is not readable: {}",
+                 filePath.toStdString());
+        emit fileTransferError(deviceId, QString(), tr("File is not readable"));
+        return false;
+    }
+
     LOG_INFO("Starting file upload for {}: {}", deviceId.toStdString(),
              filePath.toStdString());
 
@@ -567,6 +655,7 @@ void ClientManager::startFileUpload(const QString& deviceId, const QUrl& fileUrl
     message["connectionId"] = connId;
     message["filePath"] = filePath;
     m_messaging->sendMessage(message);
+    return true;
 }
 
 void ClientManager::cancelFileUpload(const QString& deviceId,
@@ -589,16 +678,51 @@ void ClientManager::cancelFileUpload(const QString& deviceId,
     m_messaging->sendMessage(message);
 }
 
-void ClientManager::startFileDownload(const QString& deviceId)
+bool ClientManager::startFileDownload(const QString& deviceId)
 {
     if (!m_messaging || !m_messaging->isReady()) {
         LOG_WARN("Cannot start file download: messaging not ready");
-        return;
+        emit fileDownloadError(deviceId, QString(), tr("Client process is not ready"));
+        return false;
     }
     QString connId = connectionIdFor(deviceId);
-    if (connId.isEmpty()) return;
+    if (connId.isEmpty()) {
+        LOG_WARN("Cannot start file download: no connection for device {}",
+                 deviceId.toStdString());
+        emit fileDownloadError(deviceId, QString(), tr("Remote connection is not ready"));
+        return false;
+    }
+
+    if (!supportsFileTransfer(deviceId)) {
+        LOG_WARN("Cannot start file download: host does not support file transfer, device={}",
+                 deviceId.toStdString());
+        emit fileDownloadError(deviceId, QString(), tr("Remote host does not support file transfer"));
+        return false;
+    }
 
     QString saveDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    if (saveDir.isEmpty()) {
+        LOG_WARN("Cannot start file download: download location is unavailable");
+        emit fileDownloadError(deviceId, QString(), tr("Download folder is unavailable"));
+        return false;
+    }
+
+    QDir dir(saveDir);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        LOG_WARN("Cannot start file download: failed to create download folder: {}",
+                 saveDir.toStdString());
+        emit fileDownloadError(deviceId, QString(), tr("Failed to create download folder"));
+        return false;
+    }
+
+    QFileInfo dirInfo(saveDir);
+    if (!dirInfo.isDir() || !dirInfo.isWritable()) {
+        LOG_WARN("Cannot start file download: download folder is not writable: {}",
+                 saveDir.toStdString());
+        emit fileDownloadError(deviceId, QString(), tr("Download folder is not writable"));
+        return false;
+    }
+
     LOG_INFO("Starting file download for {}, saveDir={}",
              deviceId.toStdString(), saveDir.toStdString());
 
@@ -607,6 +731,7 @@ void ClientManager::startFileDownload(const QString& deviceId)
     message["connectionId"] = connId;
     message["saveDir"] = saveDir;
     m_messaging->sendMessage(message);
+    return true;
 }
 
 void ClientManager::cancelFileDownload(const QString& deviceId,
@@ -658,8 +783,7 @@ bool ClientManager::pasteFilesFromClipboard(const QString& deviceId)
         if (url.isLocalFile()) {
             QFileInfo fi(url.toLocalFile());
             if (fi.exists() && fi.isFile()) {
-                startFileUpload(deviceId, url);
-                anyStarted = true;
+                anyStarted = startFileUpload(deviceId, url) || anyStarted;
             }
         }
     }
@@ -1432,7 +1556,7 @@ void ClientManager::handleFileTransferError(const QJsonObject& message)
     if (deviceId.isEmpty()) return;
 
     QString transferId = message["transferId"].toString();
-    QString errorMessage = message["errorMessage"].toString();
+    QString errorMessage = describeFileTransferError(message["errorMessage"].toString());
 
     LOG_ERROR("File transfer error: {} (transfer={})",
               errorMessage.toStdString(), transferId.toStdString());
@@ -1495,7 +1619,7 @@ void ClientManager::handleFileDownloadError(const QJsonObject& message)
     if (deviceId.isEmpty()) return;
 
     QString transferId = message["transferId"].toString();
-    QString errorMessage = message["errorMessage"].toString();
+    QString errorMessage = describeFileTransferError(message["errorMessage"].toString());
 
     LOG_ERROR("File download error: {} (transfer={})",
               errorMessage.toStdString(), transferId.toStdString());

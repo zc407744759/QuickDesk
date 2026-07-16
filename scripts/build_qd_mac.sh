@@ -48,7 +48,11 @@ echo "[*] build mode: $build_mode"
 echo "[*] clean output: $clean_output"
 echo "[*] target arch: $arch"
 
-qt_cmake_path="$ENV_QT_PATH/macos"
+if [ -d "$ENV_QT_PATH/macos" ]; then
+    qt_cmake_path="$ENV_QT_PATH/macos"
+else
+    qt_cmake_path="$ENV_QT_PATH"
+fi
 echo "Qt cmake path: $qt_cmake_path"
 
 echo

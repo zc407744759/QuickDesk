@@ -44,7 +44,11 @@ echo "[*] arch: $arch"
 echo "[*] build mode: $build_mode"
 echo
 
-qt_mac_path="$ENV_QT_PATH/macos"
+if [ -d "$ENV_QT_PATH/macos" ]; then
+    qt_mac_path="$ENV_QT_PATH/macos"
+else
+    qt_mac_path="$ENV_QT_PATH"
+fi
 publish_path="$script_path/../publish/$build_mode"
 release_path="$script_path/../output/$arch/$build_mode"
 if [ "$arch" = "x64" ]; then
@@ -113,6 +117,22 @@ elif [ -f "$thirdparty_path/quickdesk_client" ]; then
     echo "[*] copied quickdesk_client from 3rdparty"
 else
     echo "[!] warning: quickdesk_client not found"
+fi
+
+# Chromium-based helpers need ICU data next to the plain client executable.
+# The host bundle already carries it under Contents/Resources, but the client
+# runs from Contents/Frameworks with that directory as its working directory.
+if [ -f "$src_out_path/icudtl.dat" ]; then
+    cp "$src_out_path/icudtl.dat" "$frameworks_dir/"
+    echo "[*] copied icudtl.dat from src/out"
+elif [ -f "$thirdparty_path/icudtl.dat" ]; then
+    cp "$thirdparty_path/icudtl.dat" "$frameworks_dir/"
+    echo "[*] copied icudtl.dat from 3rdparty"
+elif [ -f "$frameworks_dir/quickdesk_host.app/Contents/Resources/icudtl.dat" ]; then
+    cp "$frameworks_dir/quickdesk_host.app/Contents/Resources/icudtl.dat" "$frameworks_dir/"
+    echo "[*] copied icudtl.dat from quickdesk_host.app"
+else
+    echo "[!] warning: icudtl.dat not found; quickdesk_client may crash at startup"
 fi
 
 # Copy MCP bridge
