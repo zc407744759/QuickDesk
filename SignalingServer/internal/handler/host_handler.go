@@ -126,6 +126,8 @@ func (h *HostHandler) Heartbeat(c *gin.Context) {
 	deviceID := middleware.MustDeviceID(c)
 	// Basic 1s-floor rate limit (§2.10 footnote).
 	if blocked, _ := h.rateLimit.HeartbeatThrottle(c.Request.Context(), deviceID); blocked {
+		log.Printf("[heartbeat] rate_limited device=%s ip=%s request_id=%s",
+			deviceID, c.ClientIP(), c.GetString("request_id"))
 		ProblemTooManyRequests(c, ProblemCodeRateLimited, "Heartbeat rate exceeded", 1)
 		return
 	}
@@ -133,16 +135,22 @@ func (h *HostHandler) Heartbeat(c *gin.Context) {
 	_ = c.ShouldBindJSON(&req)
 
 	if err := h.devices.Heartbeat(c.Request.Context(), deviceID, req.OS, req.OSVersion, req.AppVersion); err != nil {
+		log.Printf("[heartbeat] db_update_failed device=%s ip=%s app=%s os=%s os_version=%s err=%v request_id=%s",
+			deviceID, c.ClientIP(), req.AppVersion, req.OS, req.OSVersion, err, c.GetString("request_id"))
 		ProblemInternal(c, err.Error())
 		return
 	}
 
 	// Refresh presence heartbeat TTL.
 	if err := h.presence.Heartbeat(c.Request.Context(), deviceID); err != nil {
+		log.Printf("[heartbeat] presence_refresh_failed device=%s ip=%s err=%v request_id=%s",
+			deviceID, c.ClientIP(), err, c.GetString("request_id"))
 		ProblemInternal(c, "failed to refresh heartbeat presence")
 		return
 	}
 	state := h.presence.State(c.Request.Context(), deviceID)
+	log.Printf("[heartbeat] ok device=%s ip=%s app=%s os=%s os_version=%s presence={%s} request_id=%s",
+		deviceID, c.ClientIP(), req.AppVersion, req.OS, req.OSVersion, state.String(), c.GetString("request_id"))
 	if state.Online && h.presence.RememberOnlineCandidate(c.Request.Context(), deviceID) {
 		log.Printf("[presence] device online via heartbeat device=%s presence={%s}", deviceID, state.String())
 		if d, err := h.devices.GetByDeviceID(c.Request.Context(), deviceID); err == nil && d.UserID != nil {
@@ -177,6 +185,8 @@ type signalTokenResp struct {
 func (h *HostHandler) IssueHostSignalToken(c *gin.Context) {
 	deviceID := middleware.MustDeviceID(c)
 	if blocked, _ := h.rateLimit.SignalTokenThrottle(c.Request.Context(), deviceID); blocked {
+		log.Printf("[signal-token] host rate_limited device=%s ip=%s request_id=%s",
+			deviceID, c.ClientIP(), c.GetString("request_id"))
 		observability.Event("signal", "host_token_rate_limited", map[string]interface{}{
 			"device_id": deviceID, "request_id": c.GetString("request_id"),
 		})
@@ -188,9 +198,13 @@ func (h *HostHandler) IssueHostSignalToken(c *gin.Context) {
 		Role:     service.SignalRoleHost,
 	})
 	if err != nil {
+		log.Printf("[signal-token] host issue_failed device=%s ip=%s err=%v request_id=%s",
+			deviceID, c.ClientIP(), err, c.GetString("request_id"))
 		ProblemInternal(c, err.Error())
 		return
 	}
+	log.Printf("[signal-token] host issued device=%s ip=%s expires_at=%s request_id=%s",
+		deviceID, c.ClientIP(), exp.Format("2006-01-02T15:04:05Z"), c.GetString("request_id"))
 	c.JSON(http.StatusOK, signalTokenResp{
 		SignalToken: tok,
 		ExpiresAt:   exp.Format("2006-01-02T15:04:05Z"),
@@ -209,13 +223,19 @@ func (h *HostHandler) SetAccessCode(c *gin.Context) {
 	deviceID := middleware.MustDeviceID(c)
 	var req setAccessCodeReq
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[access-code:set] invalid_request device=%s ip=%s err=%v request_id=%s",
+			deviceID, c.ClientIP(), err, c.GetString("request_id"))
 		ProblemBadRequest(c, ProblemCodeInvalidRequest, err.Error())
 		return
 	}
 	if err := h.devices.SetAccessCode(c.Request.Context(), deviceID, req.AccessCode); err != nil {
+		log.Printf("[access-code:set] failed device=%s ip=%s code_len=%d err=%v request_id=%s",
+			deviceID, c.ClientIP(), len(req.AccessCode), err, c.GetString("request_id"))
 		ProblemInternal(c, err.Error())
 		return
 	}
+	log.Printf("[access-code:set] ok device=%s ip=%s code_len=%d request_id=%s",
+		deviceID, c.ClientIP(), len(req.AccessCode), c.GetString("request_id"))
 	// Owner gets notified so their UI refreshes. Only publish to the
 	// device's current owner (if any); unbound devices produce no user
 	// event (webhook/audit subscribers see it anyway).
@@ -340,6 +360,8 @@ func (h *HostHandler) VerifyAccessCode(c *gin.Context) {
 	// Rate-limit precheck (§2.10): per-IP ⇒ 429, per-device or
 	// per-(device,ip) ⇒ 403 TOO_MANY_ATTEMPTS.
 	if decision, _ := h.rateLimit.CheckVerifyPreflight(c.Request.Context(), deviceID, ip); decision.Blocked {
+		log.Printf("[access-code:verify] preflight_blocked device=%s ip=%s kind=%v retry_after=%d reason=%s request_id=%s",
+			deviceID, ip, decision.Kind, decision.RetryAfterSec, decision.Reason, c.GetString("request_id"))
 		switch decision.Kind {
 		case service.VerifyBlockPerIP:
 			ProblemTooManyRequests(c, ProblemCodeRateLimited, decision.Reason, decision.RetryAfterSec)
@@ -355,16 +377,22 @@ func (h *HostHandler) VerifyAccessCode(c *gin.Context) {
 
 	var req verifyCodeReq
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[access-code:verify] invalid_request device=%s ip=%s err=%v request_id=%s",
+			deviceID, ip, err, c.GetString("request_id"))
 		ProblemBadRequest(c, ProblemCodeInvalidRequest, err.Error())
 		return
 	}
 
 	exists, matches, err := h.devices.VerifyAccessCode(c.Request.Context(), deviceID, req.Code)
 	if err != nil {
+		log.Printf("[access-code:verify] lookup_failed device=%s ip=%s client_id=%s err=%v request_id=%s",
+			deviceID, ip, req.ClientID, err, c.GetString("request_id"))
 		ProblemInternal(c, err.Error())
 		return
 	}
 	if !exists {
+		log.Printf("[access-code:verify] device_not_found device=%s ip=%s client_id=%s request_id=%s",
+			deviceID, ip, req.ClientID, c.GetString("request_id"))
 		ProblemNotFound(c, ProblemCodeDeviceNotFound, "Device not registered")
 		return
 	}
@@ -379,6 +407,8 @@ func (h *HostHandler) VerifyAccessCode(c *gin.Context) {
 	// of host presence.
 	if !matches {
 		if failure, _ := h.rateLimit.RecordVerifyFailure(c.Request.Context(), deviceID, ip); failure.TripsLimit {
+			log.Printf("[access-code:verify] invalid_code_rate_limited device=%s ip=%s client_id=%s retry_after=%d request_id=%s",
+				deviceID, ip, req.ClientID, failure.RetryAfterSec, c.GetString("request_id"))
 			observability.Event("access_verify", "rate_limited", map[string]interface{}{
 				"device_id": deviceID, "ip": ip, "request_id": c.GetString("request_id"),
 			})
@@ -390,6 +420,8 @@ func (h *HostHandler) VerifyAccessCode(c *gin.Context) {
 			ProblemForbidden(c, ProblemCodeTooManyAttempts, "Too many failed attempts")
 			return
 		}
+		log.Printf("[access-code:verify] invalid_code device=%s ip=%s client_id=%s request_id=%s",
+			deviceID, ip, req.ClientID, c.GetString("request_id"))
 		observability.Event("access_verify", "rejected", map[string]interface{}{
 			"device_id": deviceID, "ip": ip, "request_id": c.GetString("request_id"), "reason": "invalid_code",
 		})
@@ -402,8 +434,8 @@ func (h *HostHandler) VerifyAccessCode(c *gin.Context) {
 		// caller who just happens to have arrived while the host is
 		// offline.
 		state := h.presence.State(c.Request.Context(), deviceID)
-		log.Printf("[access-code:verify] HOST_OFFLINE device=%s ip=%s presence={%s}",
-			deviceID, ip, state.String())
+		log.Printf("[access-code:verify] HOST_OFFLINE device=%s ip=%s client_id=%s presence={%s} request_id=%s",
+			deviceID, ip, req.ClientID, state.String(), c.GetString("request_id"))
 		h.rateLimit.ResetVerifyFailures(c.Request.Context(), deviceID, ip)
 		ProblemConflict(c, ProblemCodeHostOffline, "Host is offline")
 		return
@@ -417,9 +449,14 @@ func (h *HostHandler) VerifyAccessCode(c *gin.Context) {
 		ClientID: req.ClientID,
 	})
 	if err != nil {
+		log.Printf("[access-code:verify] token_issue_failed device=%s ip=%s client_id=%s err=%v request_id=%s",
+			deviceID, ip, req.ClientID, err, c.GetString("request_id"))
 		ProblemInternal(c, err.Error())
 		return
 	}
+	state := h.presence.State(c.Request.Context(), deviceID)
+	log.Printf("[access-code:verify] accepted device=%s ip=%s client_id=%s expires_at=%s presence={%s} request_id=%s",
+		deviceID, ip, req.ClientID, exp.Format("2006-01-02T15:04:05Z"), state.String(), c.GetString("request_id"))
 	observability.Event("access_verify", "accepted", map[string]interface{}{
 		"client_id": req.ClientID, "device_id": deviceID, "ip": ip, "request_id": c.GetString("request_id"),
 	})

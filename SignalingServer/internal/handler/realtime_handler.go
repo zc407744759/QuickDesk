@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quickdesk/signaling/internal/models"
@@ -518,25 +519,34 @@ func (h *RealtimeHandler) buildSnapshot(ctx context.Context, userID uint) (map[s
 // signalConn is a single signaling WS. role + device_id + (client_id for
 // clients) are immutable after auth_ok.
 type signalConn struct {
-	h        *RealtimeHandler
-	conn     *websocket.Conn
-	role     service.SignalRole
-	deviceID string
-	clientID string // empty for host role
-	out      chan []byte
-	done     chan struct{}
-	once     sync.Once
+	h         *RealtimeHandler
+	conn      *websocket.Conn
+	role      service.SignalRole
+	deviceID  string
+	clientID  string // empty for host role
+	sessionID string
+	remoteIP  string
+	startedAt time.Time
+	framesIn  int64
+	framesOut int64
+	out       chan []byte
+	done      chan struct{}
+	once      sync.Once
 }
 
 // HandleSignal serves GET /v1/realtime/signal.
 func (h *RealtimeHandler) HandleSignal(c *gin.Context) {
 	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
+		log.Printf("[realtime/signal] upgrade failed remote=%s err=%v", c.ClientIP(), err)
 		return
 	}
+	remoteIP := c.ClientIP()
+	log.Printf("[realtime/signal] ws accepted remote=%s ua=%q", remoteIP, c.Request.UserAgent())
 	conn.SetReadDeadline(time.Now().Add(firstFrameTimeout))
 	var af authFrame
 	if err := conn.ReadJSON(&af); err != nil {
+		log.Printf("[realtime/signal] auth read failed remote=%s err=%v", remoteIP, err)
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(4401, "auth timeout"), time.Now().Add(time.Second))
 		_ = conn.Close()
@@ -618,9 +628,12 @@ func (h *RealtimeHandler) HandleSignal(c *gin.Context) {
 		// empty), and as a last resort assign a server-side UUID so we
 		// never have "" as a map key. For host role the field is
 		// ignored anyway.
-		clientID: firstNonEmpty(af.ClientID, payload.ClientID),
-		out:      make(chan []byte, 64),
-		done:     make(chan struct{}),
+		clientID:  firstNonEmpty(af.ClientID, payload.ClientID),
+		out:       make(chan []byte, 64),
+		done:      make(chan struct{}),
+		sessionID: sessionID,
+		remoteIP:  remoteIP,
+		startedAt: time.Now(),
 	}
 	log.Printf("[realtime/signal] auth_ok role=%s device=%s client_id=%s session=%s remote=%s",
 		sc.role, sc.deviceID, sc.clientID, sessionID, c.ClientIP())
@@ -628,6 +641,8 @@ func (h *RealtimeHandler) HandleSignal(c *gin.Context) {
 		"type":       "auth_ok",
 		"session_id": sessionID,
 	}); err != nil {
+		log.Printf("[realtime/signal] auth_ok write failed role=%s device=%s client_id=%s session=%s remote=%s err=%v",
+			sc.role, sc.deviceID, sc.clientID, sessionID, remoteIP, err)
 		_ = conn.Close()
 		return
 	}
@@ -635,6 +650,8 @@ func (h *RealtimeHandler) HandleSignal(c *gin.Context) {
 	// Register in topology. For hosts we also record presence so the
 	// online derivation (搂2.4) flips immediately.
 	if err := h.registerSignalConn(sc); err != nil {
+		log.Printf("[realtime/signal] register failed role=%s device=%s client_id=%s session=%s remote=%s err=%v",
+			sc.role, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP, err)
 		writeSignalError(conn, "CONFLICT", err.Error())
 		_ = conn.Close()
 		return
@@ -685,11 +702,15 @@ func (h *RealtimeHandler) registerSignalConn(sc *signalConn) error {
 			// matches the operator expectation "reconnect should work".
 			old := h.signalHosts[sc.deviceID]
 			h.signalHosts[sc.deviceID] = sc
+			log.Printf("[realtime/signal] replacing existing host device=%s old_session=%s new_session=%s new_remote=%s",
+				sc.deviceID, old.sessionID, sc.sessionID, sc.remoteIP)
 			go old.close()
 		} else {
 			h.signalHosts[sc.deviceID] = sc
 		}
 		h.metrics.MarkSignalConnected(sc.role, sc.deviceID, sc.clientID)
+		log.Printf("[realtime/signal] registered host device=%s session=%s remote=%s",
+			sc.deviceID, sc.sessionID, sc.remoteIP)
 	case service.SignalRoleClient:
 		if sc.clientID == "" {
 			sc.clientID = "cli_" + uuid.NewString()
@@ -701,6 +722,8 @@ func (h *RealtimeHandler) registerSignalConn(sc *signalConn) error {
 		}
 		clients[sc.clientID] = sc
 		h.metrics.MarkSignalConnected(sc.role, sc.deviceID, sc.clientID)
+		log.Printf("[realtime/signal] registered client device=%s client_id=%s session=%s remote=%s clients_for_device=%d",
+			sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP, len(clients))
 	default:
 		return fmt.Errorf("unknown role %q", sc.role)
 	}
@@ -733,6 +756,13 @@ func (h *RealtimeHandler) unregisterSignalConn(sc *signalConn) {
 		}
 	}
 	h.signalMu.Unlock()
+	log.Printf("[realtime/signal] unregister role=%s device=%s client_id=%s session=%s remote=%s duration=%s frames_in=%d frames_out=%d publish_offline=%t closing_clients=%d",
+		sc.role, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP,
+		time.Since(sc.startedAt).Round(time.Millisecond),
+		atomic.LoadInt64(&sc.framesIn),
+		atomic.LoadInt64(&sc.framesOut),
+		shouldPublishOffline,
+		len(clientsToClose))
 
 	if sc.role == service.SignalRoleHost && shouldPublishOffline {
 		_ = h.presence.MarkWSDisconnected(context.Background(), sc.deviceID)
@@ -772,7 +802,14 @@ func (sc *signalConn) reader() {
 	for {
 		_, msg, err := sc.conn.ReadMessage()
 		if err != nil {
+			log.Printf("[realtime/signal] reader closed role=%s device=%s client_id=%s session=%s remote=%s err=%v frames_in=%d",
+				sc.role, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP, err, atomic.LoadInt64(&sc.framesIn))
 			return
+		}
+		n := atomic.AddInt64(&sc.framesIn, 1)
+		if n <= 5 || n%100 == 0 {
+			log.Printf("[realtime/signal] recv role=%s device=%s client_id=%s session=%s frame=%d %s",
+				sc.role, sc.deviceID, sc.clientID, sc.sessionID, n, signalFrameSummary(msg))
 		}
 		sc.h.routeSignalMessage(sc, msg)
 	}
@@ -788,12 +825,21 @@ func (sc *signalConn) writer() {
 		case msg := <-sc.out:
 			sc.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := sc.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Printf("[realtime/signal] writer text failed role=%s device=%s client_id=%s session=%s remote=%s err=%v",
+					sc.role, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP, err)
 				sc.close()
 				return
+			}
+			n := atomic.AddInt64(&sc.framesOut, 1)
+			if n <= 5 || n%100 == 0 {
+				log.Printf("[realtime/signal] sent role=%s device=%s client_id=%s session=%s frame=%d %s",
+					sc.role, sc.deviceID, sc.clientID, sc.sessionID, n, signalFrameSummary(msg))
 			}
 		case <-ping.C:
 			sc.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := sc.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[realtime/signal] writer ping failed role=%s device=%s client_id=%s session=%s remote=%s err=%v",
+					sc.role, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP, err)
 				sc.close()
 				return
 			}
@@ -805,7 +851,8 @@ func (sc *signalConn) send(msg []byte) {
 	select {
 	case sc.out <- msg:
 	default:
-		log.Printf("[realtime/signal] send queue overflow device=%s role=%s", sc.deviceID, sc.role)
+		log.Printf("[realtime/signal] send queue overflow device=%s role=%s client_id=%s session=%s queued=%d %s",
+			sc.deviceID, sc.role, sc.clientID, sc.sessionID, len(sc.out), signalFrameSummary(msg))
 	}
 }
 
@@ -827,12 +874,16 @@ func (h *RealtimeHandler) routeSignalMessage(from *signalConn, raw []byte) {
 	if err := json.Unmarshal(raw, &control); err == nil {
 		switch control.Type {
 		case "ping":
+			log.Printf("[realtime/signal] app ping role=%s device=%s client_id=%s session=%s",
+				from.role, from.deviceID, from.clientID, from.sessionID)
 			from.send(mustMarshal(map[string]interface{}{
 				"type":        "pong",
 				"server_time": time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 			}))
 			return
 		case "pong":
+			log.Printf("[realtime/signal] app pong role=%s device=%s client_id=%s session=%s",
+				from.role, from.deviceID, from.clientID, from.sessionID)
 			return
 		}
 	}
@@ -849,14 +900,20 @@ func (h *RealtimeHandler) routeSignalMessage(from *signalConn, raw []byte) {
 		target := clients[peek.ClientID]
 		h.signalMu.RUnlock()
 		if target == nil {
+			log.Printf("[realtime/signal] drop host->client no target device=%s from_session=%s target_client_id=%s %s",
+				from.deviceID, from.sessionID, peek.ClientID, signalFrameSummary(raw))
 			return
 		}
+		log.Printf("[realtime/signal] route host->client device=%s from_session=%s target_client_id=%s target_session=%s %s",
+			from.deviceID, from.sessionID, peek.ClientID, target.sessionID, signalFrameSummary(raw))
 		target.send(raw)
 	case service.SignalRoleClient:
 		h.signalMu.RLock()
 		host := h.signalHosts[from.deviceID]
 		h.signalMu.RUnlock()
 		if host == nil {
+			log.Printf("[realtime/signal] client has no host device=%s client_id=%s session=%s %s",
+				from.deviceID, from.clientID, from.sessionID, signalFrameSummary(raw))
 			from.send(mustMarshal(map[string]interface{}{
 				"type": "error",
 				"code": "PEER_DISCONNECTED",
@@ -867,8 +924,12 @@ func (h *RealtimeHandler) routeSignalMessage(from *signalConn, raw []byte) {
 		// Inject client_id so the host can address replies back.
 		injected, err := injectClientID(raw, from.clientID)
 		if err != nil {
+			log.Printf("[realtime/signal] inject client_id failed device=%s client_id=%s session=%s err=%v %s",
+				from.deviceID, from.clientID, from.sessionID, err, signalFrameSummary(raw))
 			return
 		}
+		log.Printf("[realtime/signal] route client->host device=%s client_id=%s from_session=%s host_session=%s %s",
+			from.deviceID, from.clientID, from.sessionID, host.sessionID, signalFrameSummary(raw))
 		host.send(injected)
 	}
 }
@@ -886,6 +947,33 @@ func writeSignalError(conn *websocket.Conn, code, detail string) {
 func mustMarshal(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func signalFrameSummary(raw []byte) string {
+	summary := fmt.Sprintf("bytes=%d", len(raw))
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return summary + " json=false"
+	}
+	if typ, ok := obj["type"].(string); ok && typ != "" {
+		summary += " type=" + typ
+	}
+	if action, ok := obj["action"].(string); ok && action != "" {
+		summary += " action=" + action
+	}
+	if clientID, ok := obj["client_id"].(string); ok && clientID != "" {
+		summary += " client_id=" + clientID
+	}
+	if sid, ok := obj["sid"].(string); ok && sid != "" {
+		summary += " sid=" + sid
+	}
+	if obj["sdp"] != nil {
+		summary += " has_sdp=true"
+	}
+	if obj["candidate"] != nil {
+		summary += " has_candidate=true"
+	}
+	return summary + " json=true"
 }
 
 // firstNonEmpty returns the first non-empty string from its arguments,

@@ -14,6 +14,7 @@
 #include <QList>
 #include <QMap>
 #include <QStringList>
+#include <QTimer>
 #include <QUrl>
 #include <QVariantMap>
 
@@ -39,6 +40,10 @@ struct ConnectionInfo {
     QString connectedAt;
     int width = 0;
     int height = 0;
+    bool hasLastPointerPosition = false;
+    int lastPointerX = 0;
+    int lastPointerY = 0;
+    qint64 lastInputAtMs = 0;
     
     QString signalingState = "disconnected";
     int signalingRetryCount = 0;
@@ -265,6 +270,7 @@ private:
     QHash<QString, QString> m_connIdToDeviceId;   // connectionId -> deviceId reverse lookup
     QString m_activeDeviceId;
     int m_connectionCounter = 0;
+    QTimer m_idleKeepAliveTimer;
     
     QJsonObject m_iceConfig;
 
@@ -274,6 +280,8 @@ private:
     QString findDeviceId(const QString& connectionId) const;
     QString generateConnectionId();
     void removeConnection(const QString& deviceId);
+    void updateIdleKeepAliveTimer();
+    void sendIdleKeepAlive();
 
     void handleHelloResponse(const QJsonObject& message);
     void handleSignalingStateChanged(const QJsonObject& message);

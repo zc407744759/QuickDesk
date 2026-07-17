@@ -6,6 +6,7 @@
 #include "infra/env/applicationcontext.h"
 #include "infra/log/log.h"
 #include <QJsonArray>
+#include <QJsonDocument>
 
 namespace quickdesk {
 
@@ -464,7 +465,11 @@ void HostManager::handleClientDisconnected(const QJsonObject& message)
 
     m_clients.remove(clientId);
 
-    LOG_INFO("Client disconnected: {} {} {}", clientId.toStdString(), clientUsername.toStdString(), reason.toStdString());
+    LOG_WARN("Client disconnected: connectionId={} username={} reason={} raw={}",
+             clientId.toStdString(),
+             clientUsername.toStdString(),
+             reason.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
 
     emit clientCountChanged();
     emit clientListChanged();
@@ -511,7 +516,10 @@ void HostManager::handleError(const QJsonObject& message)
     QString code = message["code"].toString();
     QString errorMsg = message["message"].toString();
     
-    LOG_WARN("Host error: {} {}", code.toStdString(), errorMsg.toStdString());
+    LOG_WARN("Host error: code={} message={} raw={}",
+             code.toStdString(),
+             errorMsg.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     emit errorOccurred(code, errorMsg);
 }
 
@@ -522,10 +530,12 @@ void HostManager::handleSignalingStateChanged(const QJsonObject& message)
     int nextRetryIn = message["nextRetryIn"].toInt();
     QString error = message["error"].toString();
     
-    qInfo() << "Signaling state changed:" << state
-            << "retry:" << retryCount
-            << "next:" << nextRetryIn << "s"
-            << "error:" << error;
+    LOG_INFO("Host signaling state changed: state={} retry={} next={}s error={} raw={}",
+             state.toStdString(),
+             retryCount,
+             nextRetryIn,
+             error.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     
     bool changed = false;
     

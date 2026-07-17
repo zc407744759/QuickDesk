@@ -24,8 +24,15 @@ namespace quickdesk {
 
 namespace {
 
+constexpr int kIdleKeepAliveIntervalMs = 30000;
+constexpr int kIdleKeepAliveMinQuietMs = 25000;
+
 QString describeFileTransferError(const QString& errorMessage)
 {
+    if (errorMessage.trimmed().isEmpty()) {
+        return QObject::tr("File transfer failed without details");
+    }
+
     static const QRegularExpression typePattern(QStringLiteral("type=(\\d+)"));
     const QRegularExpressionMatch match = typePattern.match(errorMessage);
     if (!match.hasMatch()) {
@@ -73,6 +80,9 @@ ClientManager::ClientManager(QObject* parent)
     : QObject(parent)
     , m_sharedMemoryManager(std::make_unique<SharedMemoryManager>(this))
 {
+    m_idleKeepAliveTimer.setInterval(kIdleKeepAliveIntervalMs);
+    connect(&m_idleKeepAliveTimer, &QTimer::timeout,
+            this, &ClientManager::sendIdleKeepAlive);
 }
 
 void ClientManager::setMessaging(NativeMessaging* messaging)
@@ -98,6 +108,7 @@ void ClientManager::setMessaging(NativeMessaging* messaging)
         m_connections.clear();
         m_connIdToDeviceId.clear();
         m_activeDeviceId.clear();
+        updateIdleKeepAliveTimer();
 
         if (!deviceIds.isEmpty()) {
             emit connectionCountChanged();
@@ -178,12 +189,20 @@ QString ClientManager::connectToHost(const QString& deviceId,
         LOG_INFO("Client: No ICE config available, client will use defaults");
     }
 
-    LOG_INFO("Connecting to host: {} connectionId: {}", deviceId.toStdString(), connectionId.toStdString());
+    LOG_INFO("Connecting to host: device={} connectionId={} serverUrl={} accessCodeLen={} signalTokenLen={} apiKeySet={} codec={}",
+             deviceId.toStdString(),
+             connectionId.toStdString(),
+             serverUrl.toStdString(),
+             accessCode.size(),
+             signalToken.size(),
+             !apiKey.isEmpty(),
+             videoCodec.toStdString());
     m_messaging->sendMessage(message);
 
     emit connectionCountChanged();
     emit connectionAdded(deviceId);
     emit connectionListChanged();
+    updateIdleKeepAliveTimer();
 
     if (m_activeDeviceId.isEmpty()) {
         setActiveDeviceId(deviceId);
@@ -225,6 +244,7 @@ void ClientManager::disconnectFromHost(const QString& deviceId)
             setActiveDeviceId(m_connections.firstKey());
         }
     }
+    updateIdleKeepAliveTimer();
 }
 
 void ClientManager::disconnectAll()
@@ -251,6 +271,7 @@ void ClientManager::disconnectAll()
     emit connectionCountChanged();
     emit activeConnectionChanged();
     emit connectionListChanged();
+    updateIdleKeepAliveTimer();
 }
 
 void ClientManager::sendHello(const QString& deviceId,
@@ -647,13 +668,25 @@ bool ClientManager::startFileUpload(const QString& deviceId, const QUrl& fileUrl
         return false;
     }
 
-    LOG_INFO("Starting file upload for {}: {}", deviceId.toStdString(),
-             filePath.toStdString());
+    QString normalizedPath = fileInfo.canonicalFilePath();
+    if (normalizedPath.isEmpty()) {
+        normalizedPath = fileInfo.absoluteFilePath();
+    }
+    normalizedPath = QDir::toNativeSeparators(normalizedPath);
+
+    LOG_INFO("Starting file upload: device={} connectionId={} path={} name={} size={} bytes",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             normalizedPath.toStdString(),
+             fileInfo.fileName().toStdString(),
+             fileInfo.size());
 
     QJsonObject message;
     message["type"] = "startFileUpload";
     message["connectionId"] = connId;
-    message["filePath"] = filePath;
+    message["filePath"] = normalizedPath;
+    message["filename"] = fileInfo.fileName();
+    message["fileSize"] = static_cast<double>(fileInfo.size());
     m_messaging->sendMessage(message);
     return true;
 }
@@ -980,6 +1013,71 @@ void ClientManager::removeConnection(const QString& deviceId)
         m_connIdToDeviceId.remove(it->connectionId);
         m_connections.erase(it);
     }
+    updateIdleKeepAliveTimer();
+}
+
+void ClientManager::updateIdleKeepAliveTimer()
+{
+    bool hasLiveConnection = false;
+    for (auto it = m_connections.cbegin(); it != m_connections.cend(); ++it) {
+        if (it->rtcState == RtcStatus::Connecting ||
+            it->rtcState == RtcStatus::Connected) {
+            hasLiveConnection = true;
+            break;
+        }
+    }
+
+    if (m_messaging && m_messaging->isReady() && hasLiveConnection) {
+        if (!m_idleKeepAliveTimer.isActive()) {
+            m_idleKeepAliveTimer.start();
+        }
+    } else {
+        m_idleKeepAliveTimer.stop();
+    }
+}
+
+void ClientManager::sendIdleKeepAlive()
+{
+    if (!m_messaging || !m_messaging->isReady()) {
+        updateIdleKeepAliveTimer();
+        return;
+    }
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for (auto it = m_connections.begin(); it != m_connections.end(); ++it) {
+        ConnectionInfo& conn = it.value();
+        if (conn.rtcState != RtcStatus::Connected &&
+            conn.rtcState != RtcStatus::Connecting) {
+            continue;
+        }
+        if (conn.connectionId.isEmpty()) {
+            continue;
+        }
+        if (!conn.hasLastPointerPosition || conn.rtcState != RtcStatus::Connected) {
+            continue;
+        }
+        if (conn.lastInputAtMs > 0 &&
+            now - conn.lastInputAtMs < kIdleKeepAliveMinQuietMs) {
+            continue;
+        }
+
+        QJsonObject mouse;
+        mouse["type"] = "mouseEvent";
+        mouse["connectionId"] = conn.connectionId;
+        mouse["eventType"] = "move";
+        mouse["x"] = conn.lastPointerX;
+        mouse["y"] = conn.lastPointerY;
+        mouse["button"] = 0;
+        mouse["wheelDeltaX"] = 0;
+        mouse["wheelDeltaY"] = 0;
+        m_messaging->sendMessage(mouse);
+        LOG_DEBUG("Sent idle keepalive mouse move: device={} connectionId={} x={} y={}",
+                  conn.deviceId.toStdString(),
+                  conn.connectionId.toStdString(),
+                  conn.lastPointerX,
+                  conn.lastPointerY);
+        conn.lastInputAtMs = now;
+    }
 }
 
 // --- Message handlers ---
@@ -1005,8 +1103,14 @@ void ClientManager::handleSignalingStateChanged(const QJsonObject& message)
     int nextRetryIn = message["nextRetryIn"].toInt();
     QString error = message["error"].toString();
 
-    LOG_INFO("Client signaling state changed: device={}, state={}, retry={}, next={}s, error={}",
-             deviceId.toStdString(), state.toStdString(), retryCount, nextRetryIn, error.toStdString());
+    LOG_INFO("Client signaling state changed: device={} connectionId={} state={} retry={} next={}s error={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             state.toStdString(),
+             retryCount,
+             nextRetryIn,
+             error.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
 
     m_connections[deviceId].signalingState = state;
     m_connections[deviceId].signalingRetryCount = retryCount;
@@ -1064,9 +1168,16 @@ void ClientManager::handleConnectionStateChanged(const QJsonObject& message)
         m_connections[deviceId].deviceName = hostInfo["deviceName"].toString();
     }
 
-    LOG_INFO("Connection {} (device {}) RTC state changed to: {}", connId.toStdString(), deviceId.toStdString(), stateStr.toStdString());
+    LOG_INFO("RTC state changed: device={} connectionId={} state={} signaling={} hostInfo={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             stateStr.toStdString(),
+             m_connections.value(deviceId).signalingState.toStdString(),
+             QString::fromUtf8(QJsonDocument(hostInfo).toJson(QJsonDocument::Compact)).toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     emit connectionStateChanged(deviceId, stateStr, hostInfo);
     emit connectionListChanged();
+    updateIdleKeepAliveTimer();
 }
 
 void ClientManager::handleConnectionListChanged(const QJsonObject& message)
@@ -1102,6 +1213,7 @@ void ClientManager::handleConnectionListChanged(const QJsonObject& message)
 
     emit connectionCountChanged();
     emit connectionListChanged();
+    updateIdleKeepAliveTimer();
 }
 
 void ClientManager::handleVideoFrameReady(const QJsonObject& message)
@@ -1150,7 +1262,12 @@ void ClientManager::handleError(const QJsonObject& message)
     QString code = message["code"].toString();
     QString errorMsg = message["message"].toString();
     
-    LOG_WARN("Client error: device={} {} {}", deviceId.toStdString(), code.toStdString(), errorMsg.toStdString());
+    LOG_WARN("Client error: device={} connectionId={} code={} message={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             code.toStdString(),
+             errorMsg.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     emit errorOccurred(deviceId, code, errorMsg);
 }
 
@@ -1163,8 +1280,12 @@ void ClientManager::handleConnectionFailed(const QJsonObject& message)
     QString errorCode = message["errorCode"].toString();
     QString errorMsg = message["message"].toString();
     
-    qWarning() << "Connection failed: device" << deviceId
-               << "error:" << errorCode << "-" << errorMsg;
+    LOG_WARN("Connection failed: device={} connectionId={} errorCode={} message={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             errorCode.toStdString(),
+             errorMsg.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     
     if (m_connections.contains(deviceId)) {
         m_connections[deviceId].rtcState = RtcStatus::Failed;
@@ -1193,7 +1314,10 @@ void ClientManager::handleHostConnected(const QJsonObject& message)
     QString deviceId = findDeviceId(connId);
     if (deviceId.isEmpty()) return;
 
-    LOG_INFO("Host connected: device={}", deviceId.toStdString());
+    LOG_INFO("Host connected: device={} connectionId={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     
     if (m_connections.contains(deviceId)) {
         m_connections[deviceId].rtcState = RtcStatus::Connected;
@@ -1208,7 +1332,11 @@ void ClientManager::handleHostDisconnected(const QJsonObject& message)
     QString deviceId = findDeviceId(connId);
     if (deviceId.isEmpty()) return;
 
-    LOG_INFO("Host disconnected: device={}", deviceId.toStdString());
+    LOG_WARN("Host disconnected: device={} connectionId={} signaling={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             m_connections.value(deviceId).signalingState.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     
     if (m_connections.contains(deviceId)) {
         m_connections[deviceId].rtcState = RtcStatus::Disconnected;
@@ -1239,7 +1367,11 @@ void ClientManager::handleHostConnectionFailed(const QJsonObject& message)
 
     int errorCode = message["errorCode"].toInt();
     
-    LOG_WARN("Host connection failed: device={} error code: {}", deviceId.toStdString(), errorCode);
+    LOG_WARN("Host connection failed: device={} connectionId={} errorCode={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             errorCode,
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
     
     if (m_connections.contains(deviceId)) {
         m_connections[deviceId].rtcState = RtcStatus::Failed;
@@ -1411,6 +1543,14 @@ void ClientManager::sendMouseEvent(const QString& deviceId, const QString& event
     QString connId = connectionIdFor(deviceId);
     if (connId.isEmpty()) return;
 
+    auto it = m_connections.find(deviceId);
+    if (it != m_connections.end()) {
+        it->hasLastPointerPosition = true;
+        it->lastPointerX = x;
+        it->lastPointerY = y;
+        it->lastInputAtMs = QDateTime::currentMSecsSinceEpoch();
+    }
+
     QJsonObject message;
     message["type"] = "mouseEvent";
     message["connectionId"] = connId;
@@ -1431,6 +1571,11 @@ void ClientManager::sendKeyboardEvent(const QString& deviceId, const QString& ev
     }
     QString connId = connectionIdFor(deviceId);
     if (connId.isEmpty()) return;
+
+    auto it = m_connections.find(deviceId);
+    if (it != m_connections.end()) {
+        it->lastInputAtMs = QDateTime::currentMSecsSinceEpoch();
+    }
 
     QJsonObject message;
     message["type"] = "keyboardEvent";
@@ -1531,6 +1676,14 @@ void ClientManager::handleFileTransferProgress(const QJsonObject& message)
     double bytesSent = message["bytesSent"].toDouble();
     double totalBytes = message["totalBytes"].toDouble();
 
+    LOG_DEBUG("File upload progress: device={} connectionId={} transfer={} filename={} bytesSent={} totalBytes={}",
+              deviceId.toStdString(),
+              connId.toStdString(),
+              transferId.toStdString(),
+              filename.toStdString(),
+              bytesSent,
+              totalBytes);
+
     emit fileTransferProgress(deviceId, transferId, filename, bytesSent, totalBytes);
 }
 
@@ -1543,8 +1696,12 @@ void ClientManager::handleFileTransferComplete(const QJsonObject& message)
     QString transferId = message["transferId"].toString();
     QString filename = message["filename"].toString();
 
-    LOG_INFO("File transfer complete: {} (transfer={})",
-             filename.toStdString(), transferId.toStdString());
+    LOG_INFO("File upload complete: device={} connectionId={} filename={} transfer={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             filename.toStdString(),
+             transferId.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
 
     emit fileTransferComplete(deviceId, transferId, filename);
 }
@@ -1556,10 +1713,16 @@ void ClientManager::handleFileTransferError(const QJsonObject& message)
     if (deviceId.isEmpty()) return;
 
     QString transferId = message["transferId"].toString();
-    QString errorMessage = describeFileTransferError(message["errorMessage"].toString());
+    QString rawErrorMessage = message["errorMessage"].toString();
+    QString errorMessage = describeFileTransferError(rawErrorMessage);
 
-    LOG_ERROR("File transfer error: {} (transfer={})",
-              errorMessage.toStdString(), transferId.toStdString());
+    LOG_ERROR("File upload error: device={} connectionId={} transfer={} rawError={} displayError={} raw={}",
+              deviceId.toStdString(),
+              connId.toStdString(),
+              transferId.toStdString(),
+              rawErrorMessage.toStdString(),
+              errorMessage.toStdString(),
+              QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
 
     emit fileTransferError(deviceId, transferId, errorMessage);
 }
@@ -1574,9 +1737,13 @@ void ClientManager::handleFileDownloadStarted(const QJsonObject& message)
     QString filename = message["filename"].toString();
     double totalBytes = message["totalBytes"].toDouble();
 
-    LOG_INFO("File download started: {} ({} bytes, transfer={})",
-             filename.toStdString(), static_cast<uint64_t>(totalBytes),
-             transferId.toStdString());
+    LOG_INFO("File download started: device={} connectionId={} filename={} totalBytes={} transfer={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             filename.toStdString(),
+             static_cast<uint64_t>(totalBytes),
+             transferId.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
 
     emit fileDownloadStarted(deviceId, transferId, filename, totalBytes);
 }
@@ -1592,6 +1759,14 @@ void ClientManager::handleFileDownloadProgress(const QJsonObject& message)
     double bytesReceived = message["bytesReceived"].toDouble();
     double totalBytes = message["totalBytes"].toDouble();
 
+    LOG_DEBUG("File download progress: device={} connectionId={} transfer={} filename={} bytesReceived={} totalBytes={}",
+              deviceId.toStdString(),
+              connId.toStdString(),
+              transferId.toStdString(),
+              filename.toStdString(),
+              bytesReceived,
+              totalBytes);
+
     emit fileDownloadProgress(deviceId, transferId, filename, bytesReceived, totalBytes);
 }
 
@@ -1605,9 +1780,13 @@ void ClientManager::handleFileDownloadComplete(const QJsonObject& message)
     QString filename = message["filename"].toString();
     QString savePath = message["savePath"].toString();
 
-    LOG_INFO("File download complete: {} -> {} (transfer={})",
-             filename.toStdString(), savePath.toStdString(),
-             transferId.toStdString());
+    LOG_INFO("File download complete: device={} connectionId={} filename={} savePath={} transfer={} raw={}",
+             deviceId.toStdString(),
+             connId.toStdString(),
+             filename.toStdString(),
+             savePath.toStdString(),
+             transferId.toStdString(),
+             QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
 
     emit fileDownloadComplete(deviceId, transferId, filename, savePath);
 }
@@ -1619,10 +1798,16 @@ void ClientManager::handleFileDownloadError(const QJsonObject& message)
     if (deviceId.isEmpty()) return;
 
     QString transferId = message["transferId"].toString();
-    QString errorMessage = describeFileTransferError(message["errorMessage"].toString());
+    QString rawErrorMessage = message["errorMessage"].toString();
+    QString errorMessage = describeFileTransferError(rawErrorMessage);
 
-    LOG_ERROR("File download error: {} (transfer={})",
-              errorMessage.toStdString(), transferId.toStdString());
+    LOG_ERROR("File download error: device={} connectionId={} transfer={} rawError={} displayError={} raw={}",
+              deviceId.toStdString(),
+              connId.toStdString(),
+              transferId.toStdString(),
+              rawErrorMessage.toStdString(),
+              errorMessage.toStdString(),
+              QString::fromUtf8(QJsonDocument(message).toJson(QJsonDocument::Compact)).toStdString());
 
     emit fileDownloadError(deviceId, transferId, errorMessage);
 }
