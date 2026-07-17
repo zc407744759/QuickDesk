@@ -16,6 +16,8 @@ RUN npm run build
 # ---- Stage 2: Build Go binary ----
 FROM golang:1.24-alpine AS builder
 RUN apk add --no-cache git
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.google.cn
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
@@ -28,18 +30,29 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    postgresql-15 redis-server \
-    ca-certificates procps gosu curl locales \
-    && rm -rf /var/lib/apt/lists/* \
-    && sed -i '/C.UTF-8/s/^# //' /etc/locale.gen && locale-gen
+RUN set -eux; \
+    sed -i 's|http://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources; \
+    apt-get -o Acquire::AllowInsecureRepositories=true \
+            -o Acquire::AllowDowngradeToInsecureRepositories=true \
+            update; \
+    apt-get install -y --allow-unauthenticated --no-install-recommends \
+        postgresql-15 \
+        redis-server \
+        ca-certificates \
+        procps \
+        gosu \
+        curl \
+        locales; \
+    rm -rf /var/lib/apt/lists/*; \
+    sed -i '/C.UTF-8/s/^# //' /etc/locale.gen; \
+    locale-gen
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
 COPY --from=builder /signaling /opt/quickdesk/signaling
 
-RUN mkdir -p /data/postgres /data/redis /data/logs \
+RUN mkdir -p /data/postgres /data/redis /opt/quickdesk/logs \
     && chown -R postgres:postgres /data/postgres
 
 COPY start.sh /opt/quickdesk/start.sh

@@ -724,9 +724,11 @@ QString ProcessManager::findExecutable(const QString& name)
 
 int ProcessManager::calculateRestartDelay(int retryCount) const
 {
-    // Exponential backoff: 2s, 4s, 8s, 16s, 32s (capped at 32s)
+    // Fast exponential backoff: 0.5s, 1s, 2s, 4s, 5s (capped at 5s).
+    // The host/client processes are local helpers; after a service restart or
+    // pipe churn, waiting tens of seconds makes the Windows client feel stuck.
     int delay = BASE_RESTART_DELAY_MS * (1 << (retryCount - 1));
-    return qMin(delay, 32000);
+    return qMin(delay, 5000);
 }
 
 void ProcessManager::setHostProcessStatus(ProcessStatus::Status status)

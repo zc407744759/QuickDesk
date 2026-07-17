@@ -139,13 +139,21 @@ QString ClientManager::connectToHost(const QString& deviceId,
     // Reject duplicate connections to the same device
     if (m_connections.contains(deviceId)) {
         auto& existing = m_connections[deviceId];
+        const bool signalingDead = existing.signalingState == "disconnected" ||
+                                   existing.signalingState == "failed";
         if (existing.rtcState != RtcStatus::Disconnected &&
-            existing.rtcState != RtcStatus::Failed) {
+            existing.rtcState != RtcStatus::Failed &&
+            !signalingDead) {
             LOG_INFO("Device {} already connected (connectionId={}), reusing",
                      deviceId.toStdString(), existing.connectionId.toStdString());
             return deviceId;
         }
         // Previous connection is dead — clean up and reconnect
+        LOG_WARN("Replacing stale client connection: device={} connectionId={} rtcState={} signalingState={}",
+                 deviceId.toStdString(),
+                 existing.connectionId.toStdString(),
+                 static_cast<int>(existing.rtcState),
+                 existing.signalingState.toStdString());
         removeConnection(deviceId);
     }
 

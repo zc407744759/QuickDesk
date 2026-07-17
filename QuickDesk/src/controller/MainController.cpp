@@ -109,11 +109,33 @@ MainController::MainController(QObject* parent)
         // `online` recovers automatically. We keep m_lastSignalingConnected
         // tracked only for the server-status UI indicator above.
         m_lastSignalingConnected = (state == "connected");
+
+        if (state == "connected") {
+            m_hostSignalingRecoveryAttempt = 0;
+            m_hostSignalingRecoveryTimer.stop();
+        } else if (state == "disconnected" || state == "failed") {
+            scheduleHostSignalingRecovery(state);
+        }
     });
     
     // Listen to Client signaling state to update client server status
     connect(m_clientManager.get(), &ClientManager::signalingStateChanged,
             this, &MainController::onClientSignalingStateChanged);
+    connect(m_clientManager.get(), &ClientManager::connectionStateChanged,
+            this, [this](const QString& deviceId,
+                         const QString& state,
+                         const QJsonObject&) {
+        if (state != "disconnected" && state != "failed") {
+            return;
+        }
+        auto it = m_clientReconnectIntents.constFind(deviceId);
+        if (it == m_clientReconnectIntents.constEnd() ||
+            it->userRequestedDisconnect ||
+            it->accessCode.isEmpty()) {
+            return;
+        }
+        scheduleClientReconnect(deviceId, QStringLiteral("rtc_") + state, 0);
+    });
     
     // Listen to Client connection removed to update primary device
     connect(m_clientManager.get(), &ClientManager::connectionRemoved,
@@ -253,6 +275,10 @@ MainController::MainController(QObject* parent)
     // Setup access code auto-refresh timer
     connect(&m_accessCodeRefreshTimer, &QTimer::timeout,
             this, &MainController::onAccessCodeRefreshTimer);
+
+    m_hostSignalingRecoveryTimer.setSingleShot(true);
+    connect(&m_hostSignalingRecoveryTimer, &QTimer::timeout,
+            this, &MainController::runHostSignalingRecovery);
     
     // Listen to configuration changes
     connect(&core::LocalConfigCenter::instance(), 
@@ -332,6 +358,17 @@ void MainController::shutdown()
 
     LOG_INFO("MainController::shutdown()");
 
+    m_hostSignalingRecoveryTimer.stop();
+    for (auto it = m_clientReconnectTimers.begin();
+         it != m_clientReconnectTimers.end(); ++it) {
+        auto* timer = it.value();
+        if (timer) {
+            timer->stop();
+            timer->deleteLater();
+        }
+    }
+    m_clientReconnectTimers.clear();
+
     // Stop cloud sync
     if (m_cloudDeviceManager) {
         m_cloudDeviceManager->stopSync();
@@ -364,6 +401,18 @@ QString MainController::connectToRemoteHost(const QString& deviceId,
 {
     QString url = serverUrl.isEmpty() ? getDefaultServerUrl() : serverUrl;
     LOG_INFO("Connecting to remote host: {} on {}", deviceId.toStdString(), url.toStdString());
+
+    ClientReconnectIntent intent;
+    intent.accessCode = accessCode;
+    intent.serverUrl = url;
+    intent.attempt = 0;
+    intent.userRequestedDisconnect = false;
+    m_clientReconnectIntents[deviceId] = intent;
+    QTimer* pendingReconnectTimer = m_clientReconnectTimers.take(deviceId);
+    if (pendingReconnectTimer) {
+        pendingReconnectTimer->stop();
+        pendingReconnectTimer->deleteLater();
+    }
 
     // §2.6: the Chromium client process needs a one-shot signal_token
     // for the WS first-frame auth. Qt verifies the access_code against
@@ -408,7 +457,17 @@ QString MainController::connectToRemoteHost(const QString& deviceId,
 
 void MainController::disconnectFromRemoteHost(const QString& deviceId)
 {
+    auto it = m_clientReconnectIntents.find(deviceId);
+    if (it != m_clientReconnectIntents.end()) {
+        it->userRequestedDisconnect = true;
+    }
+    QTimer* pendingReconnectTimer = m_clientReconnectTimers.take(deviceId);
+    if (pendingReconnectTimer) {
+        pendingReconnectTimer->stop();
+        pendingReconnectTimer->deleteLater();
+    }
     m_clientManager->disconnectFromHost(deviceId);
+    m_clientReconnectIntents.remove(deviceId);
 }
 
 void MainController::showRemoteWindowForDevice(const QString& deviceId)
@@ -744,6 +803,15 @@ void MainController::onClientProcessStarted()
             m_clientManager->sendHello(localDeviceId, videoCodec);
         }
     });
+
+    QTimer::singleShot(1200, this, [this]() {
+        for (auto it = m_clientReconnectIntents.begin();
+             it != m_clientReconnectIntents.end(); ++it) {
+            if (!it->userRequestedDisconnect && !it->accessCode.isEmpty()) {
+                scheduleClientReconnect(it.key(), QStringLiteral("clientProcessStarted"), 0);
+            }
+        }
+    });
 }
 
 void MainController::onClientProcessStopped(int exitCode)
@@ -776,13 +844,34 @@ void MainController::onClientSignalingStateChanged(const QString& deviceId,
                                                     int nextRetryIn,
                                                     const QString& error)
 {
-    Q_UNUSED(retryCount);
-    Q_UNUSED(nextRetryIn);
+    LOG_INFO("Client signaling state changed: device={}, state={}, retry={}, next={}s, error={}",
+             deviceId.toStdString(), state.toStdString(), retryCount,
+             nextRetryIn, error.toStdString());
 
-    LOG_INFO("Client signaling state changed: device={}, state={}",
-             deviceId.toStdString(), state.toStdString());
+    const auto intentIt = m_clientReconnectIntents.constFind(deviceId);
+    const bool canAutoReconnect =
+        intentIt != m_clientReconnectIntents.constEnd() &&
+        !intentIt->userRequestedDisconnect &&
+        !intentIt->accessCode.isEmpty();
 
-    if (state == "connected" || state == "failed" || state == "disconnected") {
+    if (state == "connected") {
+        auto reconnectIt = m_clientReconnectIntents.find(deviceId);
+        if (reconnectIt != m_clientReconnectIntents.end()) {
+            reconnectIt->attempt = 0;
+        }
+        QTimer* pendingReconnectTimer = m_clientReconnectTimers.take(deviceId);
+        if (pendingReconnectTimer) {
+            pendingReconnectTimer->stop();
+            pendingReconnectTimer->deleteLater();
+        }
+    } else if ((state == "disconnected" || state == "failed") &&
+               canAutoReconnect) {
+        const int nativeDelayMs = nextRetryIn > 0 ? nextRetryIn * 1000 : 0;
+        scheduleClientReconnect(deviceId, state, nativeDelayMs);
+    }
+
+    if (state == "connected" ||
+        ((state == "failed" || state == "disconnected") && !canAutoReconnect)) {
         auto it = m_connectionTracks.find(deviceId);
         if (it != m_connectionTracks.end()) {
             int durationSec = 0;
@@ -893,6 +982,164 @@ void MainController::bindHostDeviceIfReady(const char* reason)
 QString MainController::getDefaultServerUrl() const
 {
     return m_serverManager->serverUrl();
+}
+
+QString MainController::savedAccessCodeForHostReconnect() const
+{
+    const int interval = core::LocalConfigCenter::instance().accessCodeRefreshInterval();
+    if (interval == -1) {
+        return core::LocalConfigCenter::instance().savedAccessCode();
+    }
+    if (interval > 0) {
+        const QString nextRefreshTimeStr =
+            core::LocalConfigCenter::instance().accessCodeNextRefreshTime();
+        const QDateTime nextRefreshTime =
+            QDateTime::fromString(nextRefreshTimeStr, Qt::ISODate);
+        if (nextRefreshTime.isValid() &&
+            nextRefreshTime > QDateTime::currentDateTime()) {
+            return core::LocalConfigCenter::instance().savedAccessCode();
+        }
+    }
+    return {};
+}
+
+void MainController::scheduleHostSignalingRecovery(const QString& reason)
+{
+    if (m_isShutdown || m_hostSignalingRecoveryTimer.isActive()) {
+        return;
+    }
+
+    const int delayMs = m_hostSignalingRecoveryAttempt == 0 ? 1200 : 4000;
+    LOG_WARN("Scheduling host signaling recovery in {} ms: state={} retryAttempt={}",
+             delayMs, reason.toStdString(), m_hostSignalingRecoveryAttempt + 1);
+    m_hostSignalingRecoveryTimer.start(delayMs);
+}
+
+void MainController::runHostSignalingRecovery()
+{
+    if (m_isShutdown || !m_hostManager) {
+        return;
+    }
+    const QString state = m_hostManager->signalingState();
+    if (state == "connected") {
+        m_hostSignalingRecoveryAttempt = 0;
+        return;
+    }
+
+    ++m_hostSignalingRecoveryAttempt;
+    LOG_WARN("Running host signaling recovery: attempt={} state={} processRunning={} launchMode={}",
+             m_hostSignalingRecoveryAttempt,
+             state.toStdString(),
+             m_processManager->isHostRunning(),
+             static_cast<int>(m_processManager->hostLaunchMode()));
+
+    if (!m_processManager->isHostRunning()) {
+        m_processManager->startHostProcess();
+        scheduleHostSignalingRecovery(QStringLiteral("host_process_not_running"));
+        return;
+    }
+
+    if (m_hostSignalingRecoveryAttempt <= 2) {
+        m_hostServerStatus = ServerStatus::Connecting;
+        emit hostServerStatusChanged();
+        m_hostManager->connectToServer(getDefaultServerUrl(),
+                                       savedAccessCodeForHostReconnect());
+        scheduleHostSignalingRecovery(QStringLiteral("connect_resent"));
+        return;
+    }
+
+    LOG_WARN("Host signaling did not recover after {} attempts; restarting host helper",
+             m_hostSignalingRecoveryAttempt);
+    m_hostSignalingRecoveryAttempt = 0;
+    m_processManager->stopHostProcess();
+    QTimer::singleShot(1200, this, [this]() {
+        if (!m_isShutdown) {
+            m_processManager->startHostProcess();
+        }
+    });
+}
+
+void MainController::scheduleClientReconnect(const QString& deviceId,
+                                             const QString& reason,
+                                             int preferredDelayMs)
+{
+    if (m_isShutdown || deviceId.isEmpty()) {
+        return;
+    }
+    auto it = m_clientReconnectIntents.find(deviceId);
+    if (it == m_clientReconnectIntents.end() ||
+        it->userRequestedDisconnect ||
+        it->accessCode.isEmpty()) {
+        return;
+    }
+    if (m_clientReconnectTimers.contains(deviceId)) {
+        return;
+    }
+
+    ++it->attempt;
+    const int attemptDelayMs = qMin(5000, 500 * (1 << qMin(it->attempt - 1, 3)));
+    const int nativeDelayMs = preferredDelayMs > 0 ? qMin(preferredDelayMs, 3000) : 0;
+    const int delayMs = qMax(attemptDelayMs, nativeDelayMs);
+
+    auto* timer = new QTimer(this);
+    timer->setSingleShot(true);
+    m_clientReconnectTimers.insert(deviceId, timer);
+    connect(timer, &QTimer::timeout, this, [this, deviceId, timer]() {
+        m_clientReconnectTimers.remove(deviceId);
+        timer->deleteLater();
+        reconnectRemoteHost(deviceId);
+    });
+    LOG_WARN("Scheduling client reconnect: device={} reason={} attempt={} delayMs={}",
+             deviceId.toStdString(), reason.toStdString(), it->attempt, delayMs);
+    timer->start(delayMs);
+}
+
+void MainController::reconnectRemoteHost(const QString& deviceId)
+{
+    auto it = m_clientReconnectIntents.find(deviceId);
+    if (it == m_clientReconnectIntents.end() ||
+        it->userRequestedDisconnect ||
+        it->accessCode.isEmpty()) {
+        return;
+    }
+
+    if (!m_processManager->isClientRunning()) {
+        LOG_WARN("Client reconnect delayed because client helper is not running: device={}",
+                 deviceId.toStdString());
+        m_processManager->startClientProcess();
+        scheduleClientReconnect(deviceId, QStringLiteral("client_process_not_running"), 1000);
+        return;
+    }
+
+    const QString accessCode = it->accessCode;
+    const QString serverUrl = it->serverUrl.isEmpty() ? getDefaultServerUrl()
+                                                      : it->serverUrl;
+    LOG_WARN("Reconnecting remote host: device={} attempt={} serverUrl={}",
+             deviceId.toStdString(), it->attempt, serverUrl.toStdString());
+
+    m_cloudDeviceManager->verifyAccessCode(
+        deviceId, accessCode,
+        [this, deviceId, accessCode, serverUrl](const QString& signalToken) {
+            LOG_INFO("Reconnect verifyAccessCode OK: device={} signalTokenLen={}",
+                     deviceId.toStdString(), signalToken.size());
+            const QString result = m_clientManager->connectToHost(
+                deviceId, accessCode, signalToken, serverUrl);
+            if (result.isEmpty()) {
+                scheduleClientReconnect(deviceId,
+                                        QStringLiteral("connectToHost_empty"),
+                                        1000);
+            }
+        },
+        [this, deviceId](int httpStatus, const QString& code,
+                         const QString& detail) {
+            LOG_WARN("Reconnect verifyAccessCode failed: device={} status={} code={} detail={}",
+                     deviceId.toStdString(), httpStatus,
+                     code.toStdString(), detail.toStdString());
+            scheduleClientReconnect(deviceId,
+                                    code.isEmpty() ? QStringLiteral("verify_failed")
+                                                   : code,
+                                    2000);
+        });
 }
 
 void MainController::onAccessCodeRefreshTimer()

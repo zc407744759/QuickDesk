@@ -288,6 +288,7 @@ private:
     void onAccessCodeRefreshTimer();
     void updateAccessCodeRefreshTimer(int remainingSeconds = -1);
     QString getDefaultServerUrl() const;
+    QString savedAccessCodeForHostReconnect() const;
     QString getSkillHostBinaryPath() const;
     // Locate the directory that holds built-in skills (sys-info, file-ops, ...).
     // Layout differs by platform / build mode:
@@ -297,6 +298,12 @@ private:
     QString getBuiltinSkillsDir() const;
     void setupWebSocketApiEvents();
     void bindHostDeviceIfReady(const char* reason);
+    void scheduleHostSignalingRecovery(const QString& reason);
+    void runHostSignalingRecovery();
+    void scheduleClientReconnect(const QString& deviceId,
+                                 const QString& reason,
+                                 int preferredDelayMs = 0);
+    void reconnectRemoteHost(const QString& deviceId);
 
     // MCP HTTP process management
     void startMcpHttpProcess();
@@ -320,6 +327,18 @@ private:
         qint64 startTimeMs = 0;
     };
     QHash<QString, ConnectionTrack> m_connectionTracks;
+
+    QTimer m_hostSignalingRecoveryTimer;
+    int m_hostSignalingRecoveryAttempt = 0;
+
+    struct ClientReconnectIntent {
+        QString accessCode;
+        QString serverUrl;
+        int attempt = 0;
+        bool userRequestedDisconnect = false;
+    };
+    QHash<QString, ClientReconnectIntent> m_clientReconnectIntents;
+    QHash<QString, QTimer*> m_clientReconnectTimers;
 };
 
 } // namespace quickdesk
