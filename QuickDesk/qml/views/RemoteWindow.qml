@@ -804,10 +804,14 @@ Window {
     }
 
     property string localCurrentPath: mainController.ftpManager
-        ? mainController.ftpManager.defaultLocalDirectory() : ""
+        ? mainController.ftpManager.lastLocalDirectory() : ""
     property string remoteCurrentPath: ""
     property int selectedLocalFileIndex: -1
     property int selectedRemoteFileIndex: -1
+    property var selectedLocalPaths: ({})
+    property var selectedRemotePaths: ({})
+    property int selectedLocalCount: 0
+    property int selectedRemoteCount: 0
 
     property int activeTransferCount: {
         var count = 0
@@ -833,10 +837,132 @@ Window {
         return -1
     }
 
+    function formatBytes(bytes) {
+        var value = Number(bytes || 0)
+        var units = ["B", "KB", "MB", "GB", "TB"]
+        var unit = 0
+        while (value >= 1024 && unit < units.length - 1) {
+            value /= 1024
+            unit++
+        }
+        return (unit === 0 ? Math.round(value) : value.toFixed(value >= 10 ? 1 : 2)) + " " + units[unit]
+    }
+
+    function formatSpeed(bytesPerSecond) {
+        return remoteWindow.formatBytes(bytesPerSecond || 0) + "/s"
+    }
+
+    function pathSelected(map, path) {
+        return !!map[path || ""]
+    }
+
+    function clearLocalSelection() {
+        remoteWindow.selectedLocalPaths = ({})
+        remoteWindow.selectedLocalCount = 0
+        remoteWindow.selectedLocalFileIndex = -1
+    }
+
+    function clearRemoteSelection() {
+        remoteWindow.selectedRemotePaths = ({})
+        remoteWindow.selectedRemoteCount = 0
+        remoteWindow.selectedRemoteFileIndex = -1
+    }
+
+    function setSelectionPath(kind, path, selected) {
+        var source = kind === "local" ? remoteWindow.selectedLocalPaths : remoteWindow.selectedRemotePaths
+        var next = {}
+        var count = 0
+        for (var key in source) {
+            if (source[key]) next[key] = true
+        }
+        if (selected) next[path] = true
+        else delete next[path]
+        for (var selectedKey in next) {
+            if (next[selectedKey]) count++
+        }
+        if (kind === "local") {
+            remoteWindow.selectedLocalPaths = next
+            remoteWindow.selectedLocalCount = count
+        } else {
+            remoteWindow.selectedRemotePaths = next
+            remoteWindow.selectedRemoteCount = count
+        }
+    }
+
+    function selectOnly(kind, index, path) {
+        if (kind === "local") {
+            remoteWindow.clearLocalSelection()
+            remoteWindow.selectedLocalFileIndex = index
+        } else {
+            remoteWindow.clearRemoteSelection()
+            remoteWindow.selectedRemoteFileIndex = index
+        }
+        remoteWindow.setSelectionPath(kind, path, true)
+    }
+
+    function toggleSelection(kind, index, path) {
+        if (kind === "local") remoteWindow.selectedLocalFileIndex = index
+        else remoteWindow.selectedRemoteFileIndex = index
+        var map = kind === "local" ? remoteWindow.selectedLocalPaths : remoteWindow.selectedRemotePaths
+        remoteWindow.setSelectionPath(kind, path, !remoteWindow.pathSelected(map, path))
+    }
+
+    function selectRange(kind, fromIndex, toIndex) {
+        var model = kind === "local" ? localFileModel : remoteFileModel
+        if (model.count === 0) return
+        var start = Math.max(0, Math.min(fromIndex < 0 ? toIndex : fromIndex, toIndex))
+        var end = Math.min(model.count - 1, Math.max(fromIndex < 0 ? toIndex : fromIndex, toIndex))
+        if (kind === "local") remoteWindow.clearLocalSelection()
+        else remoteWindow.clearRemoteSelection()
+        for (var i = start; i <= end; i++) {
+            remoteWindow.setSelectionPath(kind, model.get(i).path, true)
+        }
+        if (kind === "local") remoteWindow.selectedLocalFileIndex = toIndex
+        else remoteWindow.selectedRemoteFileIndex = toIndex
+    }
+
+    function handleLocalSelection(index, path, modifiers) {
+        if (modifiers & Qt.ShiftModifier) remoteWindow.selectRange("local", remoteWindow.selectedLocalFileIndex, index)
+        else if (modifiers & (Qt.ControlModifier | Qt.MetaModifier)) remoteWindow.toggleSelection("local", index, path)
+        else remoteWindow.selectOnly("local", index, path)
+    }
+
+    function handleRemoteSelection(index, path, modifiers) {
+        if (modifiers & Qt.ShiftModifier) remoteWindow.selectRange("remote", remoteWindow.selectedRemoteFileIndex, index)
+        else if (modifiers & (Qt.ControlModifier | Qt.MetaModifier)) remoteWindow.toggleSelection("remote", index, path)
+        else remoteWindow.selectOnly("remote", index, path)
+    }
+
+    function hasSelectedLocalFiles() {
+        for (var i = 0; i < localFileModel.count; i++) {
+            var item = localFileModel.get(i)
+            if (!item.isDir && remoteWindow.pathSelected(remoteWindow.selectedLocalPaths, item.path)) return true
+        }
+        return false
+    }
+
+    function hasSelectedRemoteFiles() {
+        for (var i = 0; i < remoteFileModel.count; i++) {
+            var item = remoteFileModel.get(i)
+            if (!item.isDir && remoteWindow.pathSelected(remoteWindow.selectedRemotePaths, item.path)) return true
+        }
+        return false
+    }
+
     function filenameFromUrl(fileUrl) {
         var raw = fileUrl ? fileUrl.toString() : ""
         var parts = raw.split("/")
         return decodeURIComponent(parts.length > 0 ? parts[parts.length - 1] : raw)
+    }
+
+    function localPathFromFileUrl(fileUrl) {
+        var raw = decodeURIComponent(fileUrl ? fileUrl.toString() : "")
+        if (raw.indexOf("file://") !== 0) return raw
+        var path = raw.substring(7)
+        if (path.length > 2 && path.charAt(0) === "/" && path.charAt(2) === ":") {
+            path = path.substring(1)
+        }
+        return path
     }
 
     function localFileExists(fileUrl) {
@@ -850,15 +976,21 @@ Window {
     function addLocalFile(fileUrl) {
         var url = fileUrl ? fileUrl.toString() : ""
         if (url === "" || remoteWindow.localFileExists(fileUrl)) return
+        var path = remoteWindow.localPathFromFileUrl(fileUrl)
         localFileModel.append({
             url: url,
-            filename: remoteWindow.filenameFromUrl(fileUrl)
+            filename: remoteWindow.filenameFromUrl(fileUrl),
+            name: remoteWindow.filenameFromUrl(fileUrl),
+            path: path,
+            isDir: false,
+            size: 0
         })
-        remoteWindow.selectedLocalFileIndex = localFileModel.count - 1
+        remoteWindow.selectOnly("local", localFileModel.count - 1, path)
     }
 
     function setLocalEntries(entries) {
         localFileModel.clear()
+        remoteWindow.clearLocalSelection()
         for (var i = 0; i < entries.length; i++) {
             var item = entries[i]
             localFileModel.append({
@@ -870,19 +1002,21 @@ Window {
                 size: item.size || 0
             })
         }
-        remoteWindow.selectedLocalFileIndex = localFileModel.count > 0 ? 0 : -1
     }
 
     function refreshLocalDirectory(path) {
         if (!mainController.ftpManager) return
         remoteWindow.localCurrentPath = path || remoteWindow.localCurrentPath
+        mainController.ftpManager.saveLastLocalDirectory(remoteWindow.localCurrentPath)
         remoteWindow.setLocalEntries(mainController.ftpManager.listLocalDirectory(remoteWindow.localCurrentPath))
     }
 
     function refreshRemoteDirectory(path) {
         var devId = remoteWindow.currentDeviceId()
         if (!devId || !mainController.ftpManager) return
-        mainController.ftpManager.listRemoteDirectory(devId, path === undefined ? remoteWindow.remoteCurrentPath : path)
+        var targetPath = path === undefined ? remoteWindow.remoteCurrentPath : path
+        if (targetPath === "") targetPath = mainController.ftpManager.lastRemoteDirectory(devId)
+        mainController.ftpManager.listRemoteDirectory(devId, targetPath)
     }
 
     function fileUrlFromLocalPath(filePath) {
@@ -898,9 +1032,13 @@ Window {
         if (url === "" || remoteWindow.localFileExists(url)) return
         localFileModel.append({
             url: url,
-            filename: filename || remoteWindow.filenameFromUrl(url)
+            filename: filename || remoteWindow.filenameFromUrl(url),
+            name: filename || remoteWindow.filenameFromUrl(url),
+            path: filePath,
+            isDir: false,
+            size: 0
         })
-        remoteWindow.selectedLocalFileIndex = localFileModel.count - 1
+        remoteWindow.selectOnly("local", localFileModel.count - 1, filePath)
     }
 
     function currentDeviceId() {
@@ -929,29 +1067,25 @@ Window {
 
     function uploadSelectedLocalFile() {
         var devId = remoteWindow.currentDeviceId()
-        if (!devId || remoteWindow.selectedLocalFileIndex < 0
-                || remoteWindow.selectedLocalFileIndex >= localFileModel.count) {
-            return
+        if (!devId || !mainController.ftpManager) return
+        for (var i = 0; i < localFileModel.count; i++) {
+            var item = localFileModel.get(i)
+            if (item.isDir || !remoteWindow.pathSelected(remoteWindow.selectedLocalPaths, item.path)) continue
+            mainController.ftpManager.uploadFile(devId, remoteWindow.fileUrlFromLocalPath(item.path),
+                                                 remoteWindow.remoteCurrentPath)
         }
-        var item = localFileModel.get(remoteWindow.selectedLocalFileIndex)
-        if (item.isDir) return
-        mainController.ftpManager.uploadFile(devId, remoteWindow.fileUrlFromLocalPath(item.path),
-                                             remoteWindow.remoteCurrentPath)
         transferDialog.show()
     }
 
     function startRemoteDownload() {
         var devId = remoteWindow.currentDeviceId()
-        if (!devId || !mainController.ftpManager
-                || remoteWindow.selectedRemoteFileIndex < 0
-                || remoteWindow.selectedRemoteFileIndex >= remoteFileModel.count) return
-        var item = remoteFileModel.get(remoteWindow.selectedRemoteFileIndex)
-        if (item.isDir) {
-            remoteWindow.refreshRemoteDirectory(item.path)
-        } else {
+        if (!devId || !mainController.ftpManager) return
+        for (var i = 0; i < remoteFileModel.count; i++) {
+            var item = remoteFileModel.get(i)
+            if (item.isDir || !remoteWindow.pathSelected(remoteWindow.selectedRemotePaths, item.path)) continue
             mainController.ftpManager.downloadFile(devId, item.path, remoteWindow.localCurrentPath)
-            transferDialog.show()
         }
+        transferDialog.show()
     }
 
     // File transfer event handlers
@@ -1062,7 +1196,11 @@ Window {
         function onRemoteDirectoryListed(deviceId, path, entries) {
             if (deviceId !== remoteWindow.currentDeviceId()) return
             remoteWindow.remoteCurrentPath = path
+            if (mainController.ftpManager) {
+                mainController.ftpManager.saveLastRemoteDirectory(deviceId, path)
+            }
             remoteFileModel.clear()
+            remoteWindow.clearRemoteSelection()
             for (var i = 0; i < entries.length; i++) {
                 var item = entries[i]
                 remoteFileModel.append({
@@ -1073,26 +1211,51 @@ Window {
                     size: item.size || 0
                 })
             }
-            remoteWindow.selectedRemoteFileIndex = remoteFileModel.count > 0 ? 0 : -1
         }
 
-        function onTransferProgress(deviceId, transferId, direction, transferredBytes, totalBytes) {
+        function onClientConnected(deviceId) {
             if (deviceId !== remoteWindow.currentDeviceId()) return
+            var targetPath = remoteWindow.remoteCurrentPath
+            if (targetPath === "" && mainController.ftpManager) {
+                targetPath = mainController.ftpManager.lastRemoteDirectory(deviceId)
+            }
+            remoteWindow.refreshRemoteDirectory(targetPath)
+        }
+
+        function onTransferProgress(deviceId, transferId, direction, transferredBytes, totalBytes, filename) {
+            if (deviceId !== remoteWindow.currentDeviceId()) return
+            var now = Date.now()
             var idx = remoteWindow.findTransferIndex(transferId)
             if (idx < 0) {
                 transferModel.append({
                     transferId: transferId,
                     deviceId: deviceId,
-                    filename: direction,
+                    filename: filename || direction,
                     progress: 0,
                     status: direction === "download" ? "downloading" : "uploading",
                     errorMessage: "",
                     direction: direction,
-                    savePath: ""
+                    savePath: "",
+                    transferredBytes: transferredBytes,
+                    totalBytes: totalBytes,
+                    lastBytes: transferredBytes,
+                    lastUpdatedAt: now,
+                    speedBytesPerSecond: 0
                 })
                 idx = transferModel.count - 1
             }
+            var item = transferModel.get(idx)
+            if (filename && item.filename !== filename) {
+                transferModel.setProperty(idx, "filename", filename)
+            }
+            var elapsed = Math.max(0.001, (now - (item.lastUpdatedAt || now)) / 1000)
+            var speed = Math.max(0, (transferredBytes - (item.lastBytes || 0)) / elapsed)
             transferModel.setProperty(idx, "progress", totalBytes > 0 ? transferredBytes / totalBytes : 0)
+            transferModel.setProperty(idx, "transferredBytes", transferredBytes)
+            transferModel.setProperty(idx, "totalBytes", totalBytes)
+            transferModel.setProperty(idx, "lastBytes", transferredBytes)
+            transferModel.setProperty(idx, "lastUpdatedAt", now)
+            transferModel.setProperty(idx, "speedBytesPerSecond", speed)
         }
 
         function onTransferComplete(deviceId, transferId, direction, localPath, remotePath) {
@@ -1101,6 +1264,7 @@ Window {
             if (idx >= 0) {
                 transferModel.setProperty(idx, "status", "complete")
                 transferModel.setProperty(idx, "progress", 1)
+                transferModel.setProperty(idx, "speedBytesPerSecond", 0)
                 transferModel.setProperty(idx, "filename", direction === "download"
                     ? remoteWindow.filenameFromUrl(remoteWindow.fileUrlFromLocalPath(localPath))
                     : remoteWindow.filenameFromUrl(remoteWindow.fileUrlFromLocalPath(remotePath)))
@@ -1127,6 +1291,10 @@ Window {
         closeOnOverlay: true
         onShowingChanged: {
             if (showing) {
+                var devId = remoteWindow.currentDeviceId()
+                if (remoteWindow.remoteCurrentPath === "" && devId && mainController.ftpManager) {
+                    remoteWindow.remoteCurrentPath = mainController.ftpManager.lastRemoteDirectory(devId)
+                }
                 remoteWindow.refreshLocalDirectory(remoteWindow.localCurrentPath)
                 remoteWindow.refreshRemoteDirectory(remoteWindow.remoteCurrentPath)
             }
@@ -1199,17 +1367,22 @@ Window {
                             width: localFileListView.width
                             height: 44
                             radius: Theme.radiusSmall
-                            color: index === remoteWindow.selectedLocalFileIndex
+                            color: remoteWindow.pathSelected(remoteWindow.selectedLocalPaths, model.path)
                                 ? Theme.surfacePressed
                                 : (localHover.hovered ? Theme.surfaceHover : "transparent")
+                            border.width: remoteWindow.pathSelected(remoteWindow.selectedLocalPaths, model.path)
+                                ? Theme.borderWidthThin : 0
+                            border.color: Theme.primary
 
                             HoverHandler { id: localHover }
 
                             MouseArea {
                                 anchors.fill: parent
-                                onClicked: remoteWindow.selectedLocalFileIndex = index
+                                onClicked: function(mouse) {
+                                    remoteWindow.handleLocalSelection(index, model.path, mouse.modifiers)
+                                }
                                 onDoubleClicked: {
-                                    remoteWindow.selectedLocalFileIndex = index
+                                    remoteWindow.selectOnly("local", index, model.path)
                                     if (model.isDir) remoteWindow.refreshLocalDirectory(model.path)
                                 }
                             }
@@ -1234,20 +1407,6 @@ Window {
                                     font.pixelSize: Theme.fontSizeMedium
                                     color: Theme.text
                                     elide: Text.ElideMiddle
-                                }
-
-                                QDIconButton {
-                                    iconSource: FluentIconGlyph.cancelGlyph
-                                    buttonSize: QDIconButton.Size.Small
-                                    buttonStyle: QDIconButton.Style.Transparent
-                                    ToolTip.visible: hovered
-                                    ToolTip.text: qsTr("Remove")
-                                    onClicked: {
-                                        localFileModel.remove(index)
-                                        remoteWindow.selectedLocalFileIndex = Math.min(
-                                            remoteWindow.selectedLocalFileIndex,
-                                            localFileModel.count - 1)
-                                    }
                                 }
                             }
                         }
@@ -1275,9 +1434,7 @@ Window {
                     iconSource: FluentIconGlyph.forwardGlyph
                     buttonSize: QDIconButton.Size.Large
                     buttonStyle: QDIconButton.Style.Accent
-                    enabled: remoteWindow.selectedLocalFileIndex >= 0
-                        && remoteWindow.selectedLocalFileIndex < localFileModel.count
-                        && !localFileModel.get(remoteWindow.selectedLocalFileIndex).isDir
+                    enabled: remoteWindow.hasSelectedLocalFiles()
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Copy to remote")
                     onClicked: remoteWindow.uploadSelectedLocalFile()
@@ -1288,9 +1445,7 @@ Window {
                     buttonSize: QDIconButton.Size.Large
                     buttonStyle: QDIconButton.Style.Standard
                     ToolTip.visible: hovered
-                    enabled: remoteWindow.selectedRemoteFileIndex >= 0
-                        && remoteWindow.selectedRemoteFileIndex < remoteFileModel.count
-                        && !remoteFileModel.get(remoteWindow.selectedRemoteFileIndex).isDir
+                    enabled: remoteWindow.hasSelectedRemoteFiles()
                     ToolTip.text: qsTr("Copy from remote")
                     onClicked: remoteWindow.startRemoteDownload()
                 }
@@ -1361,18 +1516,23 @@ Window {
                         delegate: Rectangle {
                             width: remoteTransferListView.width
                             height: 44
-                            color: index === remoteWindow.selectedRemoteFileIndex
+                            color: remoteWindow.pathSelected(remoteWindow.selectedRemotePaths, model.path)
                                 ? Theme.surfacePressed
                                 : (transferHover.hovered ? Theme.surfaceHover : "transparent")
                             radius: Theme.radiusSmall
+                            border.width: remoteWindow.pathSelected(remoteWindow.selectedRemotePaths, model.path)
+                                ? Theme.borderWidthThin : 0
+                            border.color: Theme.primary
 
                             HoverHandler { id: transferHover }
 
                             MouseArea {
                                 anchors.fill: parent
-                                onClicked: remoteWindow.selectedRemoteFileIndex = index
+                                onClicked: function(mouse) {
+                                    remoteWindow.handleRemoteSelection(index, model.path, mouse.modifiers)
+                                }
                                 onDoubleClicked: {
-                                    remoteWindow.selectedRemoteFileIndex = index
+                                    remoteWindow.selectOnly("remote", index, model.path)
                                     if (model.isDir) remoteWindow.refreshRemoteDirectory(model.path)
                                     else remoteWindow.startRemoteDownload()
                                 }
@@ -1402,7 +1562,7 @@ Window {
 
                                     Text {
                                         visible: !model.isDir
-                                        text: model.size + " B"
+                                        text: remoteWindow.formatBytes(model.size)
                                         font.family: Theme.fontFamily
                                         font.pixelSize: Theme.fontSizeSmall
                                         color: Theme.textSecondary
@@ -1412,7 +1572,7 @@ Window {
                     }
 
                     QDEmptyState {
-                        visible: transferModel.count === 0
+                        visible: remoteFileModel.count === 0
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         iconSource: FluentIconGlyph.syncFolderGlyph
@@ -1420,16 +1580,84 @@ Window {
                         description: qsTr("Remote folder is empty or not loaded")
                     }
 
-                    QDButton {
+                    Rectangle {
                         visible: transferModel.count > 0
-                        Layout.alignment: Qt.AlignHCenter
-                        text: qsTr("Clear Completed")
-                        buttonType: QDButton.Type.Secondary
-                        onClicked: {
-                            for (var i = transferModel.count - 1; i >= 0; i--) {
-                                var s = transferModel.get(i).status
-                                if (s === "complete" || s === "error" || s === "cancelled" || s === "deleted") {
-                                    transferModel.remove(i)
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Math.min(150, 48 + transferQueueView.contentHeight)
+                        color: Theme.surface
+                        radius: Theme.radiusSmall
+                        border.width: Theme.borderWidthThin
+                        border.color: Theme.border
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: Theme.spacingSmall
+                            spacing: Theme.spacingSmall
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: qsTr("Transfers")
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.weight: Font.DemiBold
+                                color: Theme.textSecondary
+                            }
+
+                            ListView {
+                                id: transferQueueView
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                model: transferModel
+                                clip: true
+                                spacing: Theme.spacingSmall
+
+                                delegate: ColumnLayout {
+                                    width: transferQueueView.width
+                                    spacing: 4
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: Theme.spacingSmall
+
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: (model.direction === "download" ? qsTr("Download") : qsTr("Upload"))
+                                                + " · " + model.filename
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            color: model.status === "error" ? Theme.error : Theme.text
+                                            elide: Text.ElideMiddle
+                                        }
+
+                                        Text {
+                                            text: Math.round((model.progress || 0) * 100) + "%"
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            color: Theme.textSecondary
+                                        }
+                                    }
+
+                                    QDProgressBar {
+                                        Layout.fillWidth: true
+                                        value: model.progress || 0
+                                        progressColor: model.status === "error" ? Theme.error
+                                            : (model.status === "complete" ? Theme.success : Theme.primary)
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: model.status === "error"
+                                            ? model.errorMessage
+                                            : remoteWindow.formatBytes(model.transferredBytes || 0)
+                                                + " / " + remoteWindow.formatBytes(model.totalBytes || 0)
+                                                + " · " + (model.status === "complete"
+                                                    ? qsTr("Done")
+                                                    : remoteWindow.formatSpeed(model.speedBytesPerSecond || 0))
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.textSecondary
+                                        elide: Text.ElideRight
+                                    }
                                 }
                             }
                         }

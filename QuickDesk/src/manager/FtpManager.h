@@ -43,6 +43,10 @@ public:
 
     Q_INVOKABLE QVariantList listLocalDirectory(const QString& path) const;
     Q_INVOKABLE QString defaultLocalDirectory() const;
+    Q_INVOKABLE QString lastLocalDirectory() const;
+    Q_INVOKABLE QString lastRemoteDirectory(const QString& deviceId) const;
+    Q_INVOKABLE void saveLastLocalDirectory(const QString& path);
+    Q_INVOKABLE void saveLastRemoteDirectory(const QString& deviceId, const QString& path);
     Q_INVOKABLE QString parentDirectory(const QString& path) const;
     Q_INVOKABLE QString homeDirectory() const;
     Q_INVOKABLE QString downloadsDirectory() const;
@@ -71,7 +75,8 @@ signals:
                           const QString& transferId,
                           const QString& direction,
                           double transferredBytes,
-                          double totalBytes);
+                          double totalBytes,
+                          const QString& filename);
     void transferComplete(const QString& deviceId,
                           const QString& transferId,
                           const QString& direction,

@@ -15,6 +15,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRandomGenerator>
+#include <QSettings>
 #include <QStandardPaths>
 
 namespace quickdesk {
@@ -168,6 +169,30 @@ QString FtpManager::defaultLocalDirectory() const
 {
     QString path = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
     return path.isEmpty() ? QDir::homePath() : path;
+}
+
+QString FtpManager::lastLocalDirectory() const
+{
+    const QString saved = QSettings().value(QStringLiteral("ftp/lastLocalDirectory")).toString();
+    return saved.isEmpty() ? defaultLocalDirectory() : saved;
+}
+
+QString FtpManager::lastRemoteDirectory(const QString& deviceId) const
+{
+    if (deviceId.isEmpty()) return QString();
+    return QSettings().value(QStringLiteral("ftp/lastRemoteDirectory/%1").arg(deviceId)).toString();
+}
+
+void FtpManager::saveLastLocalDirectory(const QString& path)
+{
+    if (path.isEmpty()) return;
+    QSettings().setValue(QStringLiteral("ftp/lastLocalDirectory"), path);
+}
+
+void FtpManager::saveLastRemoteDirectory(const QString& deviceId, const QString& path)
+{
+    if (deviceId.isEmpty() || path.isEmpty()) return;
+    QSettings().setValue(QStringLiteral("ftp/lastRemoteDirectory/%1").arg(deviceId), path);
 }
 
 QString FtpManager::parentDirectory(const QString& path) const
@@ -624,7 +649,8 @@ void FtpManager::handleClientMessage(const QString& deviceId, const QJsonObject&
         it->file->write(data);
         it->receivedBytes += data.size();
         emit transferProgress(deviceId, transferId, QStringLiteral("download"),
-                              it->receivedBytes, it->totalBytes);
+                              it->receivedBytes, it->totalBytes,
+                              QFileInfo(it->localPath).fileName());
     } else if (type == QStringLiteral("qd_ftp_download_end")) {
         const QString transferId = msg.value(QStringLiteral("transfer_id")).toString();
         auto it = m_downloads.find(transferId);
@@ -676,7 +702,8 @@ void FtpManager::pumpUploadChunk(const QString& transferId)
     chunk[QStringLiteral("sent")] = static_cast<double>(it->sentBytes);
     sendClient(it->deviceId, chunk);
     emit transferProgress(it->deviceId, transferId, QStringLiteral("upload"),
-                          it->sentBytes, it->totalBytes);
+                          it->sentBytes, it->totalBytes,
+                          QFileInfo(it->remotePath).fileName());
 }
 
 } // namespace quickdesk
