@@ -43,6 +43,8 @@ MainController::MainController(QObject* parent)
     m_authManager->setHostManager(m_hostManager.get());
     m_cloudDeviceManager = std::make_unique<CloudDeviceManager>(
         m_serverManager.get(), m_authManager.get(), m_hostManager.get(), this);
+    m_ftpManager = std::make_unique<FtpManager>(
+        m_serverManager.get(), m_hostManager.get(), m_authManager.get(), this);
 
     // Create SkillHostManager and wire it to HostManager (host-side skill bridge)
     m_skillHostManager = std::make_unique<SkillHostManager>(this);
@@ -431,6 +433,8 @@ QString MainController::connectToRemoteHost(const QString& deviceId,
             if (result.isEmpty()) {
                 // ClientManager already emitted errorOccurred.
                 m_connectionTracks.remove(deviceId);
+            } else {
+                m_ftpManager->connectClient(deviceId, signalToken, url);
             }
         },
         [this, deviceId](int httpStatus, const QString& code,
@@ -467,6 +471,7 @@ void MainController::disconnectFromRemoteHost(const QString& deviceId)
         pendingReconnectTimer->deleteLater();
     }
     m_clientManager->disconnectFromHost(deviceId);
+    m_ftpManager->disconnectClient(deviceId);
     m_clientReconnectIntents.remove(deviceId);
 }
 
@@ -558,6 +563,11 @@ AuthManager* MainController::authManager() const
 CloudDeviceManager* MainController::cloudDeviceManager() const
 {
     return m_cloudDeviceManager.get();
+}
+
+FtpManager* MainController::ftpManager() const
+{
+    return m_ftpManager.get();
 }
 
 QString MainController::deviceId() const

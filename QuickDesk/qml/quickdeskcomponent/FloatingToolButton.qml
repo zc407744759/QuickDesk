@@ -641,27 +641,8 @@ Item {
 
         QDMenuItem {
             visible: root.supportsFileTransfer
-            text: qsTr("Upload File")
-            iconText: FluentIconGlyph.uploadGlyph
-            onTriggered: {
-                console.log("Upload file for:", root.deviceId)
-                root.uploadFileRequested()
-            }
-        }
-
-        QDMenuItem {
-            visible: root.supportsFileTransfer
-            text: qsTr("Download File")
-            iconText: FluentIconGlyph.downloadGlyph
-            onTriggered: {
-                console.log("Download file for:", root.deviceId)
-                root.downloadFileRequested()
-            }
-        }
-
-        QDMenuItem {
-            visible: root.supportsFileTransfer
-            text: qsTr("Transfers") + " (" + root.activeTransferCount + ")"
+            text: qsTr("File Transfer") + (root.activeTransferCount > 0
+                ? " (" + root.activeTransferCount + ")" : "")
             iconText: FluentIconGlyph.sortGlyph
             onTriggered: {
                 root.showTransferPanelRequested()

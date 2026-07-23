@@ -416,13 +416,10 @@ Window {
                         inputEnabled: !delegateItem.isSelfConnection  // Disable input for self-connection
                         
                         onFilesDropped: function(urls) {
-                            var devId = delegateItem.deviceId
-                            if (!devId || !remoteWindow.clientManager) return
-                            var anyStarted = false
                             for (var i = 0; i < urls.length; i++) {
-                                anyStarted = remoteWindow.startUploadAndTrack(devId, urls[i]) || anyStarted
+                                remoteWindow.addLocalFile(urls[i])
                             }
-                            if (anyStarted) fileTransferDrawer.open()
+                            transferDialog.show()
                         }
 
                         // Monitor video size changes (frameRate and ping updated from PerformanceTracker)
@@ -571,19 +568,17 @@ Window {
             activeTransferCount: remoteWindow.activeTransferCount
 
             onUploadFileRequested: {
+                transferDialog.show()
                 fileDialog.open()
             }
 
             onDownloadFileRequested: {
-                var devId = currentTabIndex >= 0 && currentTabIndex < connectionModel.count
-                    ? connectionModel.deviceIdAt(currentTabIndex) : ""
-                if (devId && remoteWindow.clientManager) {
-                    remoteWindow.clientManager.startFileDownload(devId)
-                }
+                transferDialog.show()
+                remoteWindow.startRemoteDownload()
             }
 
             onShowTransferPanelRequested: {
-                fileTransferDrawer.open()
+                transferDialog.show()
             }
         }
         
@@ -788,22 +783,31 @@ Window {
         title: qsTr("Select Files to Upload")
         fileMode: FileDialog.OpenFiles
         onAccepted: {
-            var devId = currentTabIndex >= 0 && currentTabIndex < connectionModel.count
-                ? connectionModel.deviceIdAt(currentTabIndex) : ""
-            if (devId && remoteWindow.clientManager) {
-                var anyStarted = false
-                for (var i = 0; i < selectedFiles.length; i++) {
-                    anyStarted = remoteWindow.startUploadAndTrack(devId, selectedFiles[i]) || anyStarted
-                }
-                if (anyStarted) fileTransferDrawer.open()
+            transferDialog.show()
+            for (var i = 0; i < selectedFiles.length; i++) {
+                remoteWindow.addLocalFile(selectedFiles[i])
             }
         }
+    }
+
+    ListModel {
+        id: localFileModel
+    }
+
+    ListModel {
+        id: remoteFileModel
     }
 
     // File transfer data model
     ListModel {
         id: transferModel
     }
+
+    property string localCurrentPath: mainController.ftpManager
+        ? mainController.ftpManager.defaultLocalDirectory() : ""
+    property string remoteCurrentPath: ""
+    property int selectedLocalFileIndex: -1
+    property int selectedRemoteFileIndex: -1
 
     property int activeTransferCount: {
         var count = 0
@@ -835,6 +839,75 @@ Window {
         return decodeURIComponent(parts.length > 0 ? parts[parts.length - 1] : raw)
     }
 
+    function localFileExists(fileUrl) {
+        var url = fileUrl ? fileUrl.toString() : ""
+        for (var i = 0; i < localFileModel.count; i++) {
+            if (localFileModel.get(i).url === url) return true
+        }
+        return false
+    }
+
+    function addLocalFile(fileUrl) {
+        var url = fileUrl ? fileUrl.toString() : ""
+        if (url === "" || remoteWindow.localFileExists(fileUrl)) return
+        localFileModel.append({
+            url: url,
+            filename: remoteWindow.filenameFromUrl(fileUrl)
+        })
+        remoteWindow.selectedLocalFileIndex = localFileModel.count - 1
+    }
+
+    function setLocalEntries(entries) {
+        localFileModel.clear()
+        for (var i = 0; i < entries.length; i++) {
+            var item = entries[i]
+            localFileModel.append({
+                url: remoteWindow.fileUrlFromLocalPath(item.path || ""),
+                filename: item.name || "",
+                name: item.name || "",
+                path: item.path || "",
+                isDir: item.isDir || false,
+                size: item.size || 0
+            })
+        }
+        remoteWindow.selectedLocalFileIndex = localFileModel.count > 0 ? 0 : -1
+    }
+
+    function refreshLocalDirectory(path) {
+        if (!mainController.ftpManager) return
+        remoteWindow.localCurrentPath = path || remoteWindow.localCurrentPath
+        remoteWindow.setLocalEntries(mainController.ftpManager.listLocalDirectory(remoteWindow.localCurrentPath))
+    }
+
+    function refreshRemoteDirectory(path) {
+        var devId = remoteWindow.currentDeviceId()
+        if (!devId || !mainController.ftpManager) return
+        mainController.ftpManager.listRemoteDirectory(devId, path === undefined ? remoteWindow.remoteCurrentPath : path)
+    }
+
+    function fileUrlFromLocalPath(filePath) {
+        if (!filePath) return ""
+        if (filePath.indexOf("file:") === 0) return filePath
+        var normalized = filePath.replace(/\\/g, "/")
+        if (normalized.charAt(0) === "/") return "file://" + normalized
+        return "file:///" + normalized
+    }
+
+    function addLocalDownloadedFile(filePath, filename) {
+        var url = remoteWindow.fileUrlFromLocalPath(filePath)
+        if (url === "" || remoteWindow.localFileExists(url)) return
+        localFileModel.append({
+            url: url,
+            filename: filename || remoteWindow.filenameFromUrl(url)
+        })
+        remoteWindow.selectedLocalFileIndex = localFileModel.count - 1
+    }
+
+    function currentDeviceId() {
+        return currentTabIndex >= 0 && currentTabIndex < connectionModel.count
+            ? connectionModel.deviceIdAt(currentTabIndex) : ""
+    }
+
     function startUploadAndTrack(deviceId, fileUrl) {
         if (!deviceId || !remoteWindow.clientManager) return false
         if (!remoteWindow.clientManager.startFileUpload(deviceId, fileUrl)) {
@@ -852,6 +925,33 @@ Window {
             savePath: ""
         })
         return true
+    }
+
+    function uploadSelectedLocalFile() {
+        var devId = remoteWindow.currentDeviceId()
+        if (!devId || remoteWindow.selectedLocalFileIndex < 0
+                || remoteWindow.selectedLocalFileIndex >= localFileModel.count) {
+            return
+        }
+        var item = localFileModel.get(remoteWindow.selectedLocalFileIndex)
+        if (item.isDir) return
+        mainController.ftpManager.uploadFile(devId, remoteWindow.fileUrlFromLocalPath(item.path),
+                                             remoteWindow.remoteCurrentPath)
+        transferDialog.show()
+    }
+
+    function startRemoteDownload() {
+        var devId = remoteWindow.currentDeviceId()
+        if (!devId || !mainController.ftpManager
+                || remoteWindow.selectedRemoteFileIndex < 0
+                || remoteWindow.selectedRemoteFileIndex >= remoteFileModel.count) return
+        var item = remoteFileModel.get(remoteWindow.selectedRemoteFileIndex)
+        if (item.isDir) {
+            remoteWindow.refreshRemoteDirectory(item.path)
+        } else {
+            mainController.ftpManager.downloadFile(devId, item.path, remoteWindow.localCurrentPath)
+            transferDialog.show()
+        }
     }
 
     // File transfer event handlers
@@ -924,7 +1024,7 @@ Window {
                 direction: "download",
                 savePath: ""
             })
-            fileTransferDrawer.open()
+            transferDialog.show()
         }
 
         function onFileDownloadProgress(deviceId, transferId, filename, bytesReceived, totalBytes) {
@@ -942,6 +1042,7 @@ Window {
                 transferModel.setProperty(idx, "progress", 1)
                 transferModel.setProperty(idx, "savePath", savePath)
             }
+            remoteWindow.addLocalDownloadedFile(savePath, filename)
             toast.show(qsTr("Download complete: %1").arg(filename), QDToast.Type.Success)
         }
 
@@ -955,206 +1056,381 @@ Window {
         }
     }
 
-    // File Transfer Drawer (right side panel)
-    QDDrawer {
-        id: fileTransferDrawer
-        edge: Qt.RightEdge
-        width: 360
-        title: qsTr("File Transfers") + (remoteWindow.activeTransferCount > 0
-            ? " (" + remoteWindow.activeTransferCount + ")" : "")
+    Connections {
+        target: mainController.ftpManager
 
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 0
-
-            // Empty state
-            QDEmptyState {
-                visible: transferModel.count === 0
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                iconSource: FluentIconGlyph.sortGlyph
-                title: qsTr("No Transfers")
-                description: qsTr("Use the menu to upload or download files")
+        function onRemoteDirectoryListed(deviceId, path, entries) {
+            if (deviceId !== remoteWindow.currentDeviceId()) return
+            remoteWindow.remoteCurrentPath = path
+            remoteFileModel.clear()
+            for (var i = 0; i < entries.length; i++) {
+                var item = entries[i]
+                remoteFileModel.append({
+                    name: item.name || "",
+                    filename: item.name || "",
+                    path: item.path || "",
+                    isDir: item.isDir || false,
+                    size: item.size || 0
+                })
             }
+            remoteWindow.selectedRemoteFileIndex = remoteFileModel.count > 0 ? 0 : -1
+        }
 
-            // Transfer list
-            ListView {
-                id: transferListView
+        function onTransferProgress(deviceId, transferId, direction, transferredBytes, totalBytes) {
+            if (deviceId !== remoteWindow.currentDeviceId()) return
+            var idx = remoteWindow.findTransferIndex(transferId)
+            if (idx < 0) {
+                transferModel.append({
+                    transferId: transferId,
+                    deviceId: deviceId,
+                    filename: direction,
+                    progress: 0,
+                    status: direction === "download" ? "downloading" : "uploading",
+                    errorMessage: "",
+                    direction: direction,
+                    savePath: ""
+                })
+                idx = transferModel.count - 1
+            }
+            transferModel.setProperty(idx, "progress", totalBytes > 0 ? transferredBytes / totalBytes : 0)
+        }
+
+        function onTransferComplete(deviceId, transferId, direction, localPath, remotePath) {
+            if (deviceId !== remoteWindow.currentDeviceId()) return
+            var idx = remoteWindow.findTransferIndex(transferId)
+            if (idx >= 0) {
+                transferModel.setProperty(idx, "status", "complete")
+                transferModel.setProperty(idx, "progress", 1)
+                transferModel.setProperty(idx, "filename", direction === "download"
+                    ? remoteWindow.filenameFromUrl(remoteWindow.fileUrlFromLocalPath(localPath))
+                    : remoteWindow.filenameFromUrl(remoteWindow.fileUrlFromLocalPath(remotePath)))
+                transferModel.setProperty(idx, "savePath", localPath || "")
+            }
+            remoteWindow.refreshLocalDirectory(remoteWindow.localCurrentPath)
+            remoteWindow.refreshRemoteDirectory(remoteWindow.remoteCurrentPath)
+            toast.show(direction === "download" ? qsTr("Download complete") : qsTr("Upload complete"),
+                       QDToast.Type.Success)
+        }
+
+        function onErrorOccurred(deviceId, code, message) {
+            if (deviceId !== "" && deviceId !== remoteWindow.currentDeviceId()) return
+            toast.show(message, QDToast.Type.Error)
+        }
+    }
+
+    QDDialog {
+        id: transferDialog
+        title: qsTr("File Transfer") + (remoteWindow.activeTransferCount > 0
+            ? " (" + remoteWindow.activeTransferCount + ")" : "")
+        dialogWidth: Math.min(remoteWindow.width - Theme.spacingXLarge * 2, 980)
+        dialogHeight: Math.min(remoteWindow.height - Theme.spacingXLarge * 2, 620)
+        closeOnOverlay: true
+        onShowingChanged: {
+            if (showing) {
+                remoteWindow.refreshLocalDirectory(remoteWindow.localCurrentPath)
+                remoteWindow.refreshRemoteDirectory(remoteWindow.remoteCurrentPath)
+            }
+        }
+
+        RowLayout {
+            anchors.fill: parent
+            spacing: Theme.spacingMedium
+
+            Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                visible: transferModel.count > 0
-                model: transferModel
-                clip: true
-                spacing: 2
+                Layout.minimumWidth: 300
+                color: Theme.surfaceVariant
+                radius: Theme.radiusMedium
+                border.width: Theme.borderWidthThin
+                border.color: Theme.border
 
-                delegate: Rectangle {
-                    width: transferListView.width
-                    height: transferItemLayout.implicitHeight + Theme.spacingMedium * 2
-                    color: delegateHover.hovered ? Theme.surfaceHover : "transparent"
-                    radius: Theme.radiusSmall
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: Theme.spacingMedium
+                    spacing: Theme.spacingMedium
 
-                    HoverHandler { id: delegateHover }
+                    RowLayout {
+                        Layout.fillWidth: true
 
-                    ColumnLayout {
-                        id: transferItemLayout
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingMedium
-                        spacing: Theme.spacingSmall
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: Theme.spacingSmall
-
-                            // Direction icon (upload/download)
-                            Text {
-                                text: model.direction === "download"
-                                    ? FluentIconGlyph.downloadGlyph
-                                    : FluentIconGlyph.uploadGlyph
-                                font.family: "Segoe Fluent Icons"
-                                font.pixelSize: Theme.iconSizeMedium
-                                color: {
-                                    if (model.status === "complete") return Theme.success
-                                    if (model.status === "error" || model.status === "cancelled") return Theme.error
-                                    return Theme.primary
-                                }
-                            }
-
-                            // Filename
-                            Text {
-                                Layout.fillWidth: true
-                                text: model.filename
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSizeMedium
-                                color: Theme.text
-                                elide: Text.ElideMiddle
-                            }
-
-                            // Status / action
-                            Text {
-                                visible: model.status === "uploading" || model.status === "downloading"
-                                text: Math.round(model.progress * 100) + "%"
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.textSecondary
-                            }
-
-                            // Cancel button (for uploading or downloading)
-                            QDIconButton {
-                                visible: model.status === "uploading" || model.status === "downloading"
-                                iconSource: FluentIconGlyph.cancelGlyph
-                                buttonSize: QDIconButton.Size.Small
-                                buttonStyle: QDIconButton.Style.Transparent
-                                onClicked: {
-                                    var item = transferModel.get(index)
-                                    if (item.transferId && remoteWindow.clientManager) {
-                                        if (item.direction === "download") {
-                                            remoteWindow.clientManager.cancelFileDownload(
-                                                item.deviceId, item.transferId)
-                                        } else {
-                                            remoteWindow.clientManager.cancelFileUpload(
-                                                item.deviceId, item.transferId)
-                                        }
-                                    }
-                                    transferModel.setProperty(index, "status", "cancelled")
-                                    transferModel.setProperty(index, "errorMessage", qsTr("Cancelled"))
-                                }
-                            }
-
-                            // Completed download actions
-                            Row {
-                                visible: model.status === "complete" && model.direction === "download" && model.savePath !== ""
-                                spacing: 2
-
-                                QDIconButton {
-                                    iconSource: FluentIconGlyph.openFileGlyph
-                                    buttonSize: QDIconButton.Size.Small
-                                    buttonStyle: QDIconButton.Style.Transparent
-                                    ToolTip.visible: hovered
-                                    ToolTip.text: qsTr("Open File")
-                                    onClicked: remoteWindow.clientManager.openDownloadedFile(model.savePath)
-                                }
-
-                                QDIconButton {
-                                    iconSource: FluentIconGlyph.folderOpenGlyph
-                                    buttonSize: QDIconButton.Size.Small
-                                    buttonStyle: QDIconButton.Style.Transparent
-                                    ToolTip.visible: hovered
-                                    ToolTip.text: qsTr("Open Folder")
-                                    onClicked: remoteWindow.clientManager.openContainingFolder(model.savePath)
-                                }
-
-                                QDIconButton {
-                                    iconSource: FluentIconGlyph.deleteGlyph
-                                    buttonSize: QDIconButton.Size.Small
-                                    buttonStyle: QDIconButton.Style.Transparent
-                                    ToolTip.visible: hovered
-                                    ToolTip.text: qsTr("Delete File")
-                                    onClicked: {
-                                        if (remoteWindow.clientManager.deleteDownloadedFile(model.savePath)) {
-                                            transferModel.setProperty(index, "status", "deleted")
-                                            transferModel.setProperty(index, "errorMessage", qsTr("File deleted"))
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Upload complete icon
-                            Text {
-                                visible: model.status === "complete" && (model.direction === "upload" || model.savePath === "")
-                                text: FluentIconGlyph.checkMarkGlyph
-                                font.family: "Segoe Fluent Icons"
-                                font.pixelSize: 14
-                                color: Theme.success
-                            }
-
-                            // Error icon
-                            Text {
-                                visible: model.status === "error" || model.status === "cancelled" || model.status === "deleted"
-                                text: model.status === "deleted" ? FluentIconGlyph.deleteGlyph : FluentIconGlyph.errorGlyph
-                                font.family: "Segoe Fluent Icons"
-                                font.pixelSize: 14
-                                color: model.status === "deleted" ? Theme.textSecondary : Theme.error
-                            }
-                        }
-
-                        // Progress bar (for uploading or downloading)
-                        QDProgressBar {
-                            visible: model.status === "uploading" || model.status === "downloading"
-                            Layout.fillWidth: true
-                            value: model.progress
-                            from: 0
-                            to: 1
-                        }
-
-                        // Status message
                         Text {
-                            visible: (model.status === "error" || model.status === "cancelled" || model.status === "deleted") && model.errorMessage !== ""
                             Layout.fillWidth: true
-                            text: model.errorMessage
+                            text: qsTr("Controller Files")
                             font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: model.status === "deleted" ? Theme.textSecondary : Theme.error
-                            elide: Text.ElideRight
+                            font.pixelSize: Theme.fontSizeLarge
+                            font.weight: Font.DemiBold
+                            color: Theme.text
                         }
+
+                        QDButton {
+                            text: qsTr("Up")
+                            iconText: FluentIconGlyph.backGlyph
+                            buttonType: QDButton.Type.Secondary
+                            onClicked: remoteWindow.refreshLocalDirectory(
+                                mainController.ftpManager.parentDirectory(remoteWindow.localCurrentPath))
+                        }
+
+                        QDButton {
+                            text: qsTr("Home")
+                            buttonType: QDButton.Type.Secondary
+                            onClicked: remoteWindow.refreshLocalDirectory(mainController.ftpManager.homeDirectory())
+                        }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: remoteWindow.localCurrentPath
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.textSecondary
+                        elide: Text.ElideMiddle
+                    }
+
+                    ListView {
+                        id: localFileListView
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        visible: localFileModel.count > 0
+                        model: localFileModel
+                        clip: true
+                        spacing: 2
+
+                        delegate: Rectangle {
+                            width: localFileListView.width
+                            height: 44
+                            radius: Theme.radiusSmall
+                            color: index === remoteWindow.selectedLocalFileIndex
+                                ? Theme.surfacePressed
+                                : (localHover.hovered ? Theme.surfaceHover : "transparent")
+
+                            HoverHandler { id: localHover }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: remoteWindow.selectedLocalFileIndex = index
+                                onDoubleClicked: {
+                                    remoteWindow.selectedLocalFileIndex = index
+                                    if (model.isDir) remoteWindow.refreshLocalDirectory(model.path)
+                                }
+                            }
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: Theme.spacingMedium
+                                anchors.rightMargin: Theme.spacingSmall
+                                spacing: Theme.spacingSmall
+
+                                Text {
+                                    text: model.isDir ? FluentIconGlyph.folderGlyph : FluentIconGlyph.documentGlyph
+                                    font.family: "Segoe Fluent Icons"
+                                    font.pixelSize: Theme.iconSizeMedium
+                                    color: Theme.primary
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: model.filename
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSizeMedium
+                                    color: Theme.text
+                                    elide: Text.ElideMiddle
+                                }
+
+                                QDIconButton {
+                                    iconSource: FluentIconGlyph.cancelGlyph
+                                    buttonSize: QDIconButton.Size.Small
+                                    buttonStyle: QDIconButton.Style.Transparent
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: qsTr("Remove")
+                                    onClicked: {
+                                        localFileModel.remove(index)
+                                        remoteWindow.selectedLocalFileIndex = Math.min(
+                                            remoteWindow.selectedLocalFileIndex,
+                                            localFileModel.count - 1)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    QDEmptyState {
+                        visible: localFileModel.count === 0
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        iconSource: FluentIconGlyph.folderOpenGlyph
+                        title: qsTr("No Local Files")
+                        description: qsTr("This folder is empty")
                     }
                 }
             }
 
-            // Clear completed button
-            Rectangle {
-                visible: transferModel.count > 0
-                Layout.fillWidth: true
-                Layout.preferredHeight: 48
-                color: Theme.surfaceVariant
+            ColumnLayout {
+                Layout.preferredWidth: 72
+                Layout.fillHeight: true
+                spacing: Theme.spacingMedium
 
-                QDButton {
-                    anchors.centerIn: parent
-                    text: qsTr("Clear Completed")
-                    onClicked: {
-                        for (var i = transferModel.count - 1; i >= 0; i--) {
-                            var s = transferModel.get(i).status
-                            if (s === "complete" || s === "error" || s === "cancelled" || s === "deleted") {
-                                transferModel.remove(i)
+                Item { Layout.fillHeight: true }
+
+                QDIconButton {
+                    iconSource: FluentIconGlyph.forwardGlyph
+                    buttonSize: QDIconButton.Size.Large
+                    buttonStyle: QDIconButton.Style.Accent
+                    enabled: remoteWindow.selectedLocalFileIndex >= 0
+                        && remoteWindow.selectedLocalFileIndex < localFileModel.count
+                        && !localFileModel.get(remoteWindow.selectedLocalFileIndex).isDir
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Copy to remote")
+                    onClicked: remoteWindow.uploadSelectedLocalFile()
+                }
+
+                QDIconButton {
+                    iconSource: FluentIconGlyph.backGlyph
+                    buttonSize: QDIconButton.Size.Large
+                    buttonStyle: QDIconButton.Style.Standard
+                    ToolTip.visible: hovered
+                    enabled: remoteWindow.selectedRemoteFileIndex >= 0
+                        && remoteWindow.selectedRemoteFileIndex < remoteFileModel.count
+                        && !remoteFileModel.get(remoteWindow.selectedRemoteFileIndex).isDir
+                    ToolTip.text: qsTr("Copy from remote")
+                    onClicked: remoteWindow.startRemoteDownload()
+                }
+
+                Item { Layout.fillHeight: true }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.minimumWidth: 300
+                color: Theme.surfaceVariant
+                radius: Theme.radiusMedium
+                border.width: Theme.borderWidthThin
+                border.color: Theme.border
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: Theme.spacingMedium
+                    spacing: Theme.spacingMedium
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: qsTr("Remote Files")
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeLarge
+                            font.weight: Font.DemiBold
+                            color: Theme.text
+                        }
+
+                        QDButton {
+                            text: qsTr("Up")
+                            iconText: FluentIconGlyph.backGlyph
+                            buttonType: QDButton.Type.Secondary
+                            onClicked: remoteWindow.refreshRemoteDirectory(
+                                mainController.ftpManager.parentDirectory(remoteWindow.remoteCurrentPath))
+                        }
+
+                        QDButton {
+                            text: qsTr("Refresh")
+                            iconText: FluentIconGlyph.syncGlyph
+                            buttonType: QDButton.Type.Secondary
+                            onClicked: remoteWindow.refreshRemoteDirectory(remoteWindow.remoteCurrentPath)
+                        }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: remoteWindow.remoteCurrentPath
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.textSecondary
+                        elide: Text.ElideMiddle
+                    }
+
+                    ListView {
+                        id: remoteTransferListView
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        visible: remoteFileModel.count > 0
+                        model: remoteFileModel
+                        clip: true
+                        spacing: 2
+
+                        delegate: Rectangle {
+                            width: remoteTransferListView.width
+                            height: 44
+                            color: index === remoteWindow.selectedRemoteFileIndex
+                                ? Theme.surfacePressed
+                                : (transferHover.hovered ? Theme.surfaceHover : "transparent")
+                            radius: Theme.radiusSmall
+
+                            HoverHandler { id: transferHover }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: remoteWindow.selectedRemoteFileIndex = index
+                                onDoubleClicked: {
+                                    remoteWindow.selectedRemoteFileIndex = index
+                                    if (model.isDir) remoteWindow.refreshRemoteDirectory(model.path)
+                                    else remoteWindow.startRemoteDownload()
+                                }
+                            }
+
+                            RowLayout {
+                                id: transferItemLayout
+                                anchors.fill: parent
+                                anchors.margins: Theme.spacingMedium
+                                spacing: Theme.spacingSmall
+
+                                    Text {
+                                        text: model.isDir ? FluentIconGlyph.folderGlyph : FluentIconGlyph.documentGlyph
+                                        font.family: "Segoe Fluent Icons"
+                                        font.pixelSize: Theme.iconSizeMedium
+                                        color: Theme.primary
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: model.name
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSizeMedium
+                                        color: Theme.text
+                                        elide: Text.ElideMiddle
+                                    }
+
+                                    Text {
+                                        visible: !model.isDir
+                                        text: model.size + " B"
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.textSecondary
+                                    }
+                            }
+                        }
+                    }
+
+                    QDEmptyState {
+                        visible: transferModel.count === 0
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        iconSource: FluentIconGlyph.syncFolderGlyph
+                        title: qsTr("No Remote Files")
+                        description: qsTr("Remote folder is empty or not loaded")
+                    }
+
+                    QDButton {
+                        visible: transferModel.count > 0
+                        Layout.alignment: Qt.AlignHCenter
+                        text: qsTr("Clear Completed")
+                        buttonType: QDButton.Type.Secondary
+                        onClicked: {
+                            for (var i = transferModel.count - 1; i >= 0; i--) {
+                                var s = transferModel.get(i).status
+                                if (s === "complete" || s === "error" || s === "cancelled" || s === "deleted") {
+                                    transferModel.remove(i)
+                                }
                             }
                         }
                     }

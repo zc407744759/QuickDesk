@@ -21,6 +21,7 @@ set(MANAGER_SOURCES
     src/manager/SkillHostManager.cpp
     src/manager/AuthManager.cpp
     src/manager/CloudDeviceManager.cpp
+    src/manager/FtpManager.cpp
 )
 
 set(MANAGER_HEADERS
@@ -36,6 +37,7 @@ set(MANAGER_HEADERS
     src/manager/SkillHostManager.h
     src/manager/AuthManager.h
     src/manager/CloudDeviceManager.h
+    src/manager/FtpManager.h
 )
 
 set(CONTROLLER_SOURCES

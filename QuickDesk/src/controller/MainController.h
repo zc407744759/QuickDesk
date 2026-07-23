@@ -21,6 +21,7 @@
 #include "../manager/SkillHostManager.h"
 #include "../manager/AuthManager.h"
 #include "../manager/CloudDeviceManager.h"
+#include "../manager/FtpManager.h"
 #include "../common/ProcessStatus.h"
 
 namespace quickdesk {
@@ -43,6 +44,7 @@ class MainController : public QObject {
     Q_PROPERTY(PresetManager* presetManager READ presetManager CONSTANT)
     Q_PROPERTY(AuthManager* authManager READ authManager CONSTANT)
     Q_PROPERTY(CloudDeviceManager* cloudDeviceManager READ cloudDeviceManager CONSTANT)
+    Q_PROPERTY(FtpManager* ftpManager READ ftpManager CONSTANT)
     
     // Host status
     Q_PROPERTY(ProcessStatus::Status hostProcessStatus READ hostProcessStatus NOTIFY hostProcessStatusChanged)
@@ -139,6 +141,7 @@ public:
     PresetManager* presetManager() const;
     AuthManager* authManager() const;
     CloudDeviceManager* cloudDeviceManager() const;
+    FtpManager* ftpManager() const;
 
     // Host convenience properties
     QString deviceId() const;
@@ -263,6 +266,7 @@ private:
     std::unique_ptr<PresetManager> m_presetManager;
     std::unique_ptr<AuthManager> m_authManager;
     std::unique_ptr<CloudDeviceManager> m_cloudDeviceManager;
+    std::unique_ptr<FtpManager> m_ftpManager;
     std::unique_ptr<WebSocketApiServer> m_wsApiServer;
     std::unique_ptr<SkillHostManager> m_skillHostManager;
 

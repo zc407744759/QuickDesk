@@ -209,6 +209,7 @@ type authFrame struct {
 	Role        string `json:"role,omitempty"`
 	DeviceID    string `json:"device_id,omitempty"`
 	ClientID    string `json:"client_id,omitempty"`
+	Channel     string `json:"channel,omitempty"`
 }
 
 const (
@@ -524,6 +525,7 @@ type signalConn struct {
 	role      service.SignalRole
 	deviceID  string
 	clientID  string // empty for host role
+	channel   string
 	sessionID string
 	remoteIP  string
 	startedAt time.Time
@@ -629,14 +631,15 @@ func (h *RealtimeHandler) HandleSignal(c *gin.Context) {
 		// never have "" as a map key. For host role the field is
 		// ignored anyway.
 		clientID:  firstNonEmpty(af.ClientID, payload.ClientID),
+		channel:   af.Channel,
 		out:       make(chan []byte, 64),
 		done:      make(chan struct{}),
 		sessionID: sessionID,
 		remoteIP:  remoteIP,
 		startedAt: time.Now(),
 	}
-	log.Printf("[realtime/signal] auth_ok role=%s device=%s client_id=%s session=%s remote=%s",
-		sc.role, sc.deviceID, sc.clientID, sessionID, c.ClientIP())
+	log.Printf("[realtime/signal] auth_ok role=%s channel=%s device=%s client_id=%s session=%s remote=%s",
+		sc.role, sc.channel, sc.deviceID, sc.clientID, sessionID, c.ClientIP())
 	if err := conn.WriteJSON(map[string]interface{}{
 		"type":       "auth_ok",
 		"session_id": sessionID,
@@ -658,7 +661,7 @@ func (h *RealtimeHandler) HandleSignal(c *gin.Context) {
 	}
 	defer h.unregisterSignalConn(sc)
 
-	if sc.role == service.SignalRoleHost {
+	if sc.role == service.SignalRoleHost && sc.channel == "" {
 		if err := h.presence.MarkWSConnected(c.Request.Context(), sc.deviceID); err == nil {
 			state := h.presence.State(c.Request.Context(), sc.deviceID)
 			log.Printf("[realtime/signal] host presence connected device=%s session=%s presence={%s}",
@@ -695,35 +698,36 @@ func (h *RealtimeHandler) HandleSignal(c *gin.Context) {
 func (h *RealtimeHandler) registerSignalConn(sc *signalConn) error {
 	h.signalMu.Lock()
 	defer h.signalMu.Unlock()
+	key := signalTopologyKey(sc.deviceID, sc.channel)
 	switch sc.role {
 	case service.SignalRoleHost:
-		if _, exists := h.signalHosts[sc.deviceID]; exists {
+		if _, exists := h.signalHosts[key]; exists {
 			// Keep latest wins: close the old one and replace. This
 			// matches the operator expectation "reconnect should work".
-			old := h.signalHosts[sc.deviceID]
-			h.signalHosts[sc.deviceID] = sc
-			log.Printf("[realtime/signal] replacing existing host device=%s old_session=%s new_session=%s new_remote=%s",
-				sc.deviceID, old.sessionID, sc.sessionID, sc.remoteIP)
+			old := h.signalHosts[key]
+			h.signalHosts[key] = sc
+			log.Printf("[realtime/signal] replacing existing host channel=%s device=%s old_session=%s new_session=%s new_remote=%s",
+				sc.channel, sc.deviceID, old.sessionID, sc.sessionID, sc.remoteIP)
 			go old.close()
 		} else {
-			h.signalHosts[sc.deviceID] = sc
+			h.signalHosts[key] = sc
 		}
 		h.metrics.MarkSignalConnected(sc.role, sc.deviceID, sc.clientID)
-		log.Printf("[realtime/signal] registered host device=%s session=%s remote=%s",
-			sc.deviceID, sc.sessionID, sc.remoteIP)
+		log.Printf("[realtime/signal] registered host channel=%s device=%s session=%s remote=%s",
+			sc.channel, sc.deviceID, sc.sessionID, sc.remoteIP)
 	case service.SignalRoleClient:
 		if sc.clientID == "" {
 			sc.clientID = "cli_" + uuid.NewString()
 		}
-		clients, ok := h.signalClient[sc.deviceID]
+		clients, ok := h.signalClient[key]
 		if !ok {
 			clients = map[string]*signalConn{}
-			h.signalClient[sc.deviceID] = clients
+			h.signalClient[key] = clients
 		}
 		clients[sc.clientID] = sc
 		h.metrics.MarkSignalConnected(sc.role, sc.deviceID, sc.clientID)
-		log.Printf("[realtime/signal] registered client device=%s client_id=%s session=%s remote=%s clients_for_device=%d",
-			sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP, len(clients))
+		log.Printf("[realtime/signal] registered client channel=%s device=%s client_id=%s session=%s remote=%s clients_for_device=%d",
+			sc.channel, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP, len(clients))
 	default:
 		return fmt.Errorf("unknown role %q", sc.role)
 	}
@@ -734,30 +738,31 @@ func (h *RealtimeHandler) unregisterSignalConn(sc *signalConn) {
 	var clientsToClose []*signalConn
 	shouldPublishOffline := false
 	h.signalMu.Lock()
+	key := signalTopologyKey(sc.deviceID, sc.channel)
 	switch sc.role {
 	case service.SignalRoleHost:
-		if cur := h.signalHosts[sc.deviceID]; cur == sc {
-			delete(h.signalHosts, sc.deviceID)
+		if cur := h.signalHosts[key]; cur == sc {
+			delete(h.signalHosts, key)
 			h.metrics.MarkSignalDisconnected(sc.role, sc.deviceID, sc.clientID)
-			for _, cc := range h.signalClient[sc.deviceID] {
+			for _, cc := range h.signalClient[key] {
 				clientsToClose = append(clientsToClose, cc)
 			}
-			shouldPublishOffline = true
+			shouldPublishOffline = sc.channel == ""
 		}
 	case service.SignalRoleClient:
-		if m := h.signalClient[sc.deviceID]; m != nil {
+		if m := h.signalClient[key]; m != nil {
 			if cur := m[sc.clientID]; cur == sc {
 				delete(m, sc.clientID)
 				h.metrics.MarkSignalDisconnected(sc.role, sc.deviceID, sc.clientID)
 				if len(m) == 0 {
-					delete(h.signalClient, sc.deviceID)
+					delete(h.signalClient, key)
 				}
 			}
 		}
 	}
 	h.signalMu.Unlock()
-	log.Printf("[realtime/signal] unregister role=%s device=%s client_id=%s session=%s remote=%s duration=%s frames_in=%d frames_out=%d publish_offline=%t closing_clients=%d",
-		sc.role, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP,
+	log.Printf("[realtime/signal] unregister role=%s channel=%s device=%s client_id=%s session=%s remote=%s duration=%s frames_in=%d frames_out=%d publish_offline=%t closing_clients=%d",
+		sc.role, sc.channel, sc.deviceID, sc.clientID, sc.sessionID, sc.remoteIP,
 		time.Since(sc.startedAt).Round(time.Millisecond),
 		atomic.LoadInt64(&sc.framesIn),
 		atomic.LoadInt64(&sc.framesOut),
@@ -895,8 +900,9 @@ func (h *RealtimeHandler) routeSignalMessage(from *signalConn, raw []byte) {
 			ClientID string `json:"client_id"`
 		}
 		_ = json.Unmarshal(raw, &peek)
+		key := signalTopologyKey(from.deviceID, from.channel)
 		h.signalMu.RLock()
-		clients := h.signalClient[from.deviceID]
+		clients := h.signalClient[key]
 		target := clients[peek.ClientID]
 		h.signalMu.RUnlock()
 		if target == nil {
@@ -908,8 +914,9 @@ func (h *RealtimeHandler) routeSignalMessage(from *signalConn, raw []byte) {
 			from.deviceID, from.sessionID, peek.ClientID, target.sessionID, signalFrameSummary(raw))
 		target.send(raw)
 	case service.SignalRoleClient:
+		key := signalTopologyKey(from.deviceID, from.channel)
 		h.signalMu.RLock()
-		host := h.signalHosts[from.deviceID]
+		host := h.signalHosts[key]
 		h.signalMu.RUnlock()
 		if host == nil {
 			log.Printf("[realtime/signal] client has no host device=%s client_id=%s session=%s %s",
@@ -947,6 +954,13 @@ func writeSignalError(conn *websocket.Conn, code, detail string) {
 func mustMarshal(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func signalTopologyKey(deviceID, channel string) string {
+	if channel == "" {
+		return deviceID
+	}
+	return deviceID + "|" + channel
 }
 
 func signalFrameSummary(raw []byte) string {
