@@ -7,35 +7,11 @@
 #include <QDir>
 #include <QFileInfo>
 #ifdef Q_OS_WIN
-#include <QProcessEnvironment>
 #include <qt_windows.h>
 #include <winsvc.h>
 #endif
 
 namespace quickdesk {
-
-#ifdef Q_OS_WIN
-namespace {
-
-bool allowWindowsHostChildProcessFallback()
-{
-#ifdef QT_DEBUG
-    return true;
-#else
-    return QProcessEnvironment::systemEnvironment()
-        .value(QStringLiteral("QUICKDESK_ALLOW_HOST_CHILD_PROCESS")) == QStringLiteral("1");
-#endif
-}
-
-QString windowsHostServiceRequiredMessage()
-{
-    return QStringLiteral(
-        "QuickDeskHost Windows service is required. Reinstall QuickDesk as administrator "
-        "or start the QuickDeskHost service.");
-}
-
-} // namespace
-#endif
 
 ProcessManager::ProcessManager(QObject* parent)
     : QObject(parent)
@@ -96,17 +72,6 @@ bool ProcessManager::startHostProcess()
         connectToHostServiceAsync();
         return true;
     }
-
-    if (!allowWindowsHostChildProcessFallback()) {
-        const QString error = windowsHostServiceRequiredMessage();
-        LOG_WARN("{}", error.toStdString());
-        emit hostProcessError(error);
-        setHostProcessStatus(ProcessStatus::Failed);
-        return false;
-    }
-
-    LOG_WARN("QuickDeskHost service is not running; falling back to child "
-             "process because QUICKDESK_ALLOW_HOST_CHILD_PROCESS=1");
 #endif
 
     return startHostAsChildProcess();
@@ -887,18 +852,8 @@ void ProcessManager::connectToHostServiceAsync()
                     m_hostRestartTimer.start(delay);
                     return;
                 }
-                LOG_WARN("Service pipe reconnect failed after {} attempts",
-                         MAX_RESTART_ATTEMPTS);
-            }
-
-            if (!allowWindowsHostChildProcessFallback()) {
-                const QString error = windowsHostServiceRequiredMessage();
-                LOG_WARN("{}", error.toStdString());
-                emit hostProcessError(error);
-                m_hostLaunchMode = HostLaunchMode::Unknown;
-                emit hostLaunchModeChanged();
-                setHostProcessStatus(ProcessStatus::Failed);
-                return;
+                LOG_WARN("Service pipe reconnect failed after {} attempts, "
+                         "falling back to child process", MAX_RESTART_ATTEMPTS);
             }
 
             // Service not running or retries exhausted — fallback.
@@ -949,22 +904,11 @@ void ProcessManager::onServicePipeError()
             m_hostRestartTimer.start(delay);
             return;
         }
-        LOG_WARN("Service pipe unavailable after {} retries", MAX_RESTART_ATTEMPTS);
+        LOG_WARN("Service pipe unavailable after {} retries, falling back to "
+                 "child process", MAX_RESTART_ATTEMPTS);
     } else {
-        LOG_INFO("Service not running");
+        LOG_INFO("Service not running, starting as child process");
     }
-
-#ifdef Q_OS_WIN
-    if (!allowWindowsHostChildProcessFallback()) {
-        const QString error = windowsHostServiceRequiredMessage();
-        LOG_WARN("{}", error.toStdString());
-        emit hostProcessError(error);
-        m_hostLaunchMode = HostLaunchMode::Unknown;
-        emit hostLaunchModeChanged();
-        setHostProcessStatus(ProcessStatus::Failed);
-        return;
-    }
-#endif
 
     m_hostLaunchMode = HostLaunchMode::Unknown;
     emit hostLaunchModeChanged();
