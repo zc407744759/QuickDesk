@@ -17,12 +17,15 @@
 #include <QRandomGenerator>
 #include <QSettings>
 #include <QStandardPaths>
+#include <algorithm>
 
 namespace quickdesk {
 
 namespace {
 constexpr qint64 kChunkSize = 48 * 1024;
 constexpr int kChunkIntervalMs = 1;
+constexpr int kMaxHostTokenRetryDelayMs = 30000;
+constexpr int kMaxClientReconnectDelayMs = 10000;
 
 bool isFtpType(const QString& type)
 {
@@ -56,6 +59,7 @@ FtpManager::FtpManager(ServerManager* serverManager,
                     if (m_hostManager->isConnected()) startHost();
                     else stopHost();
                 });
+        QTimer::singleShot(0, this, &FtpManager::startHost);
     }
 }
 
@@ -73,9 +77,19 @@ void FtpManager::startHost()
     if (!m_hostManager || !m_hostManager->isConnected()
             || m_hostManager->deviceId().isEmpty()
             || m_hostManager->deviceSecret().isEmpty()) {
+        LOG_WARN("[FtpManager] startHost skipped: connected={} deviceIdEmpty={} secretEmpty={}",
+                 m_hostManager && m_hostManager->isConnected(),
+                 !m_hostManager || m_hostManager->deviceId().isEmpty(),
+                 !m_hostManager || m_hostManager->deviceSecret().isEmpty());
         return;
     }
     if (hostOnline()) return;
+    if (m_hostTokenRequestInFlight) {
+        LOG_INFO("[FtpManager] FTP host token request already in flight");
+        return;
+    }
+    LOG_INFO("[FtpManager] starting FTP host channel: device={}",
+             m_hostManager->deviceId().toStdString());
     requestHostSignalToken();
 }
 
@@ -84,6 +98,7 @@ void FtpManager::stopHost()
     if (!m_hostSocket) return;
     auto* socket = m_hostSocket;
     m_hostSocket = nullptr;
+    LOG_INFO("[FtpManager] stopping FTP host channel");
     socket->close();
     socket->deleteLater();
     emit hostOnlineChanged();
@@ -100,6 +115,8 @@ void FtpManager::connectClient(const QString& deviceId,
     }
 
     disconnectClient(deviceId);
+    LOG_INFO("[FtpManager] connecting FTP client channel: device={} server={}",
+             deviceId.toStdString(), serverUrl.toStdString());
 
     ClientSession session;
     session.signalToken = signalToken;
@@ -109,6 +126,8 @@ void FtpManager::connectClient(const QString& deviceId,
 
     auto* socket = session.socket;
     connect(socket, &QWebSocket::connected, this, [this, deviceId, socket]() {
+        LOG_INFO("[FtpManager] FTP client socket connected: device={}",
+                 deviceId.toStdString());
         QJsonObject auth;
         auth[QStringLiteral("type")] = QStringLiteral("auth");
         auth[QStringLiteral("role")] = QStringLiteral("client");
@@ -122,18 +141,54 @@ void FtpManager::connectClient(const QString& deviceId,
         const QJsonObject msg = QJsonDocument::fromJson(text.toUtf8()).object();
         const QString type = msg.value(QStringLiteral("type")).toString();
         if (type == QStringLiteral("auth_ok")) {
+            auto* session = clientSession(deviceId);
+            if (session) {
+                session->authenticated = true;
+                session->reconnectCount = 0;
+            }
+            LOG_INFO("[FtpManager] FTP client auth_ok: device={}",
+                     deviceId.toStdString());
             emit clientConnected(deviceId);
-            listRemoteDirectory(deviceId, QString());
+            const QString pendingPath = session ? session->pendingListPath : QString();
+            if (session) session->pendingListPath.clear();
+            listRemoteDirectory(deviceId, pendingPath);
+            return;
+        }
+        if (type == QStringLiteral("error")) {
+            if (auto* session = clientSession(deviceId)) {
+                session->authenticated = false;
+            }
+            const QString code = msg.value(QStringLiteral("code")).toString(QStringLiteral("FTP_SIGNAL_ERROR"));
+            QString message = msg.value(QStringLiteral("message")).toString();
+            if (message.isEmpty()) message = msg.value(QStringLiteral("detail")).toString();
+            if (message.isEmpty() && code == QStringLiteral("PEER_DISCONNECTED")) {
+                message = tr("Remote file channel is unavailable. Install the latest QuickDesk on the remote device and redeploy the signaling server if needed.");
+            }
+            if (message.isEmpty()) message = tr("Remote file channel error");
+            LOG_ERROR("[FtpManager] FTP client signal error: device={} code={} message={}",
+                      deviceId.toStdString(), code.toStdString(), message.toStdString());
+            emit errorOccurred(deviceId, code, message);
+            scheduleClientReconnect(deviceId, code);
             return;
         }
         if (isFtpType(type)) {
             handleClientMessage(deviceId, msg);
         }
     });
-    connect(socket, &QWebSocket::disconnected, this, [this, deviceId]() {
+    connect(socket, &QWebSocket::disconnected, this, [this, deviceId, socket]() {
+        auto* session = clientSession(deviceId);
+        if (session && session->socket != socket) return;
+        if (session) session->authenticated = false;
+        LOG_WARN("[FtpManager] FTP client disconnected: device={}",
+                 deviceId.toStdString());
         emit clientDisconnected(deviceId);
+        scheduleClientReconnect(deviceId, QStringLiteral("socket disconnected"));
     });
     connect(socket, &QWebSocket::errorOccurred, this, [this, deviceId, socket](QAbstractSocket::SocketError) {
+        auto* session = clientSession(deviceId);
+        if (session && session->socket != socket) return;
+        LOG_ERROR("[FtpManager] FTP client socket error: device={} error={}",
+                  deviceId.toStdString(), socket->errorString().toStdString());
         emit errorOccurred(deviceId, QStringLiteral("FTP_SOCKET_ERROR"), socket->errorString());
     });
 
@@ -145,6 +200,8 @@ void FtpManager::disconnectClient(const QString& deviceId)
     auto it = m_clients.find(deviceId);
     if (it == m_clients.end()) return;
     if (it->socket) {
+        LOG_INFO("[FtpManager] disconnecting FTP client channel: device={}",
+                 deviceId.toStdString());
         it->socket->close();
         it->socket->deleteLater();
     }
@@ -214,9 +271,21 @@ QString FtpManager::downloadsDirectory() const
 
 void FtpManager::listRemoteDirectory(const QString& deviceId, const QString& path)
 {
+    auto* session = clientSession(deviceId);
+    if (!session || !session->socket || !session->authenticated
+            || session->socket->state() != QAbstractSocket::ConnectedState) {
+        if (session) session->pendingListPath = path;
+        LOG_WARN("[FtpManager] queue remote list until FTP client is ready: device={} path={} hasSession={} state={}",
+                 deviceId.toStdString(), path.toStdString(), session != nullptr,
+                 session && session->socket ? static_cast<int>(session->socket->state()) : -1);
+        scheduleClientReconnect(deviceId, QStringLiteral("list requested while not ready"));
+        return;
+    }
     QJsonObject msg;
     msg[QStringLiteral("type")] = QStringLiteral("qd_ftp_list_req");
     msg[QStringLiteral("path")] = path;
+    LOG_INFO("[FtpManager] send remote list request: device={} path={}",
+             deviceId.toStdString(), path.toStdString());
     sendClient(deviceId, msg);
 }
 
@@ -224,6 +293,12 @@ void FtpManager::uploadFile(const QString& deviceId,
                             const QUrl& localFileUrl,
                             const QString& remoteDirectory)
 {
+    if (!isClientReady(deviceId)) {
+        emit errorOccurred(deviceId, QStringLiteral("FTP_NOT_READY"),
+                           tr("Remote file channel is reconnecting. Please try again in a moment."));
+        scheduleClientReconnect(deviceId, QStringLiteral("upload requested while not ready"));
+        return;
+    }
     if (!localFileUrl.isLocalFile()) {
         emit errorOccurred(deviceId, QStringLiteral("LOCAL_FILE_INVALID"),
                            tr("Only local files can be uploaded"));
@@ -273,6 +348,12 @@ void FtpManager::downloadFile(const QString& deviceId,
                               const QString& remoteFilePath,
                               const QString& localDirectory)
 {
+    if (!isClientReady(deviceId)) {
+        emit errorOccurred(deviceId, QStringLiteral("FTP_NOT_READY"),
+                           tr("Remote file channel is reconnecting. Please try again in a moment."));
+        scheduleClientReconnect(deviceId, QStringLiteral("download requested while not ready"));
+        return;
+    }
     if (remoteFilePath.isEmpty()) return;
     QDir dir(localDirectory.isEmpty() ? defaultLocalDirectory() : localDirectory);
     if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
@@ -286,6 +367,9 @@ void FtpManager::downloadFile(const QString& deviceId,
     req[QStringLiteral("transfer_id")] = transferId;
     req[QStringLiteral("remote_path")] = remoteFilePath;
     m_downloadTargetDirs.insert(transferId, dir.absolutePath());
+    LOG_INFO("[FtpManager] request download: device={} transfer={} remote={} localDir={}",
+             deviceId.toStdString(), transferId.toStdString(),
+             remoteFilePath.toStdString(), dir.absolutePath().toStdString());
     sendClient(deviceId, req);
 }
 
@@ -293,6 +377,12 @@ void FtpManager::makeRemoteDirectory(const QString& deviceId,
                                      const QString& parentPath,
                                      const QString& name)
 {
+    if (!isClientReady(deviceId)) {
+        emit errorOccurred(deviceId, QStringLiteral("FTP_NOT_READY"),
+                           tr("Remote file channel is reconnecting. Please try again in a moment."));
+        scheduleClientReconnect(deviceId, QStringLiteral("mkdir requested while not ready"));
+        return;
+    }
     QJsonObject req;
     req[QStringLiteral("type")] = QStringLiteral("qd_ftp_mkdir_req");
     req[QStringLiteral("path")] = pathJoin(parentPath, name);
@@ -302,6 +392,12 @@ void FtpManager::makeRemoteDirectory(const QString& deviceId,
 
 void FtpManager::deleteRemotePath(const QString& deviceId, const QString& remotePath)
 {
+    if (!isClientReady(deviceId)) {
+        emit errorOccurred(deviceId, QStringLiteral("FTP_NOT_READY"),
+                           tr("Remote file channel is reconnecting. Please try again in a moment."));
+        scheduleClientReconnect(deviceId, QStringLiteral("delete requested while not ready"));
+        return;
+    }
     QJsonObject req;
     req[QStringLiteral("type")] = QStringLiteral("qd_ftp_delete_req");
     req[QStringLiteral("path")] = remotePath;
@@ -359,6 +455,19 @@ QJsonObject FtpManager::entryForFileInfo(const QFileInfo& info)
 void FtpManager::requestHostSignalToken()
 {
     if (!m_hostManager || !m_authManager) return;
+    if (!m_hostManager->isConnected()
+            || m_hostManager->deviceId().isEmpty()
+            || m_hostManager->deviceSecret().isEmpty()) {
+        LOG_WARN("[FtpManager] skip FTP host token request: connected={} deviceIdEmpty={} secretEmpty={}",
+                 m_hostManager->isConnected(),
+                 m_hostManager->deviceId().isEmpty(),
+                 m_hostManager->deviceSecret().isEmpty());
+        return;
+    }
+    if (m_hostTokenRequestInFlight) return;
+    m_hostTokenRequestInFlight = true;
+    LOG_INFO("[FtpManager] requesting FTP host signal token: device={}",
+             m_hostManager->deviceId().toStdString());
     QUrl url(httpBaseUrl() + QStringLiteral("v1/devices/")
              + m_hostManager->deviceId()
              + QStringLiteral("/signal-tokens"));
@@ -372,23 +481,44 @@ void FtpManager::requestHostSignalToken()
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
     auto* reply = m_network.post(req, QByteArray("{}"));
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        m_hostTokenRequestInFlight = false;
         const QByteArray body = reply->readAll();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (reply->error() != QNetworkReply::NoError || status < 200 || status >= 300) {
+            const QString msg = problemMessage(body, reply->errorString());
+            LOG_ERROR("[FtpManager] FTP host signal token failed: http={} error={} detail={}",
+                      status, reply->errorString().toStdString(), msg.toStdString());
             emit errorOccurred(QString(), QStringLiteral("HOST_TOKEN_FAILED"),
-                               problemMessage(body, reply->errorString()));
+                               msg);
             reply->deleteLater();
+            scheduleHostSignalTokenRetry(msg);
             return;
         }
         const QString token = QJsonDocument::fromJson(body).object()
             .value(QStringLiteral("signal_token")).toString();
         reply->deleteLater();
         if (token.isEmpty()) {
+            LOG_ERROR("[FtpManager] FTP host signal token empty");
             emit errorOccurred(QString(), QStringLiteral("HOST_TOKEN_EMPTY"),
                                tr("Server returned an empty FTP host token"));
+            scheduleHostSignalTokenRetry(QStringLiteral("empty token"));
             return;
         }
+        m_hostTokenRetryCount = 0;
         openHostSocket(token);
+    });
+}
+
+void FtpManager::scheduleHostSignalTokenRetry(const QString& reason)
+{
+    if (!m_hostManager || !m_hostManager->isConnected()) return;
+    const int delay = std::min(kMaxHostTokenRetryDelayMs,
+                               1000 * (1 << std::min(m_hostTokenRetryCount, 5)));
+    ++m_hostTokenRetryCount;
+    LOG_WARN("[FtpManager] scheduling FTP host token retry: delayMs={} reason={}",
+             delay, reason.toStdString());
+    QTimer::singleShot(delay, this, [this]() {
+        if (!hostOnline()) startHost();
     });
 }
 
@@ -397,6 +527,7 @@ void FtpManager::openHostSocket(const QString& token)
     stopHost();
     m_hostSocket = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
     connect(m_hostSocket, &QWebSocket::connected, this, [this, token]() {
+        LOG_INFO("[FtpManager] FTP host socket connected; sending auth");
         QJsonObject auth;
         auth[QStringLiteral("type")] = QStringLiteral("auth");
         auth[QStringLiteral("role")] = QStringLiteral("host");
@@ -408,11 +539,17 @@ void FtpManager::openHostSocket(const QString& token)
     connect(m_hostSocket, &QWebSocket::textMessageReceived,
             this, &FtpManager::onHostTextMessage);
     connect(m_hostSocket, &QWebSocket::disconnected, this, [this]() {
+        LOG_WARN("[FtpManager] FTP host socket disconnected");
         emit hostOnlineChanged();
+        if (m_hostManager && m_hostManager->isConnected()) {
+            scheduleHostSignalTokenRetry(QStringLiteral("host socket disconnected"));
+        }
     });
     connect(m_hostSocket, &QWebSocket::errorOccurred, this,
             [this](QAbstractSocket::SocketError) {
                 if (m_hostSocket) {
+                    LOG_ERROR("[FtpManager] FTP host socket error: {}",
+                              m_hostSocket->errorString().toStdString());
                     emit errorOccurred(QString(), QStringLiteral("FTP_HOST_SOCKET_ERROR"),
                                        m_hostSocket->errorString());
                 }
@@ -432,8 +569,56 @@ void FtpManager::sendClient(const QString& deviceId, const QJsonObject& obj)
 
 void FtpManager::sendJson(QWebSocket* socket, const QJsonObject& obj)
 {
-    if (!socket || socket->state() != QAbstractSocket::ConnectedState) return;
+    if (!socket || socket->state() != QAbstractSocket::ConnectedState) {
+        LOG_WARN("[FtpManager] drop message because socket is not connected: type={} state={}",
+                 obj.value(QStringLiteral("type")).toString().toStdString(),
+                 socket ? static_cast<int>(socket->state()) : -1);
+        return;
+    }
     socket->sendTextMessage(QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact)));
+}
+
+bool FtpManager::isClientReady(const QString& deviceId) const
+{
+    auto it = m_clients.find(deviceId);
+    return it != m_clients.end()
+        && it->authenticated
+        && it->socket
+        && it->socket->state() == QAbstractSocket::ConnectedState;
+}
+
+void FtpManager::scheduleClientReconnect(const QString& deviceId, const QString& reason)
+{
+    auto* session = clientSession(deviceId);
+    if (!session || session->signalToken.isEmpty()) return;
+    if (session->socket && session->socket->state() == QAbstractSocket::ConnectedState
+            && session->authenticated) {
+        return;
+    }
+
+    const QString signalToken = session->signalToken;
+    const QString serverUrl = session->serverUrl;
+    const QString pendingListPath = session->pendingListPath;
+    const int retryIndex = session->reconnectCount;
+    session->reconnectCount += 1;
+    const int delay = std::min(kMaxClientReconnectDelayMs,
+                               1000 * (1 << std::min(retryIndex, 3)));
+    LOG_WARN("[FtpManager] scheduling FTP client reconnect: device={} delayMs={} reason={}",
+             deviceId.toStdString(), delay, reason.toStdString());
+
+    QTimer::singleShot(delay, this, [this, deviceId, signalToken, serverUrl, pendingListPath]() {
+        auto* current = clientSession(deviceId);
+        if (!current) return;
+        if (current->socket && current->socket->state() == QAbstractSocket::ConnectedState
+                && current->authenticated) {
+            return;
+        }
+        connectClient(deviceId, signalToken, serverUrl);
+        auto* next = clientSession(deviceId);
+        if (next && !pendingListPath.isNull()) {
+            next->pendingListPath = pendingListPath;
+        }
+    });
 }
 
 FtpManager::ClientSession* FtpManager::clientSession(const QString& deviceId)
@@ -453,6 +638,7 @@ void FtpManager::onHostTextMessage(const QString& text)
     const QJsonObject msg = QJsonDocument::fromJson(text.toUtf8()).object();
     const QString type = msg.value(QStringLiteral("type")).toString();
     if (type == QStringLiteral("auth_ok")) {
+        LOG_INFO("[FtpManager] FTP host auth_ok");
         emit hostOnlineChanged();
     } else if (type == QStringLiteral("qd_ftp_list_req")) {
         handleHostListRequest(msg);
@@ -477,11 +663,18 @@ void FtpManager::handleHostListRequest(const QJsonObject& msg)
     QString path = msg.value(QStringLiteral("path")).toString();
     if (path.isEmpty()) path = QDir::homePath();
     QDir dir(path);
+    if (!dir.exists()) {
+        LOG_WARN("[FtpManager] host list path does not exist, falling back home: path={}",
+                 path.toStdString());
+        dir = QDir(QDir::homePath());
+    }
     QJsonArray arr;
     const QFileInfoList entries = dir.entryInfoList(
         QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Readable,
         QDir::DirsFirst | QDir::Name | QDir::IgnoreCase);
     for (const QFileInfo& info : entries) arr.append(entryForFileInfo(info));
+    LOG_INFO("[FtpManager] host list response: path={} entries={}",
+             dir.absolutePath().toStdString(), entries.size());
     QJsonObject res;
     res[QStringLiteral("type")] = QStringLiteral("qd_ftp_list_res");
     res[QStringLiteral("client_id")] = clientId;
@@ -620,6 +813,10 @@ void FtpManager::handleClientMessage(const QString& deviceId, const QJsonObject&
         QVariantList entries;
         const QJsonArray arr = msg.value(QStringLiteral("entries")).toArray();
         for (const auto& v : arr) entries.append(v.toObject().toVariantMap());
+        LOG_INFO("[FtpManager] remote directory listed: device={} path={} entries={}",
+                 deviceId.toStdString(),
+                 msg.value(QStringLiteral("path")).toString().toStdString(),
+                 entries.size());
         emit remoteDirectoryListed(deviceId, msg.value(QStringLiteral("path")).toString(), entries);
     } else if (type == QStringLiteral("qd_ftp_download_start")) {
         const QString transferId = msg.value(QStringLiteral("transfer_id")).toString();

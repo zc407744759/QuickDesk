@@ -94,6 +94,9 @@ private:
         QWebSocket* socket = nullptr;
         QString signalToken;
         QString serverUrl;
+        bool authenticated = false;
+        QString pendingListPath;
+        int reconnectCount = 0;
     };
 
     struct UploadState {
@@ -124,10 +127,13 @@ private:
     static QJsonObject entryForFileInfo(const QFileInfo& info);
 
     void requestHostSignalToken();
+    void scheduleHostSignalTokenRetry(const QString& reason);
     void openHostSocket(const QString& token);
     void sendHost(const QJsonObject& obj);
     void sendClient(const QString& deviceId, const QJsonObject& obj);
     void sendJson(QWebSocket* socket, const QJsonObject& obj);
+    bool isClientReady(const QString& deviceId) const;
+    void scheduleClientReconnect(const QString& deviceId, const QString& reason);
     ClientSession* clientSession(const QString& deviceId);
     QWebSocket* clientSocket(const QString& deviceId) const;
 
@@ -148,6 +154,8 @@ private:
     QNetworkAccessManager m_network;
 
     QWebSocket* m_hostSocket = nullptr;
+    int m_hostTokenRetryCount = 0;
+    bool m_hostTokenRequestInFlight = false;
     QHash<QString, ClientSession> m_clients;
     QHash<QString, UploadState> m_uploads;
     QHash<QString, DownloadState> m_downloads;
