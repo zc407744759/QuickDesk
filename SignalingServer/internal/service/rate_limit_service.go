@@ -133,9 +133,9 @@ type VerifyPreflightResult struct {
 type VerifyBlockKind int
 
 const (
-	VerifyBlockNone     VerifyBlockKind = iota
-	VerifyBlockPerIP                    // general IP throttle → 429
-	VerifyBlockPerDevice                // per-device or per-(device,ip) → 403
+	VerifyBlockNone      VerifyBlockKind = iota
+	VerifyBlockPerIP                     // general IP throttle → 429
+	VerifyBlockPerDevice                 // per-device or per-(device,ip) → 403
 )
 
 // CheckVerifyPreflight runs the pre-comparison checks used by
@@ -204,10 +204,15 @@ func (s *RateLimitService) HeartbeatThrottle(ctx context.Context, deviceID strin
 }
 
 // SignalTokenThrottle protects POST /v1/devices/:id/signal-tokens. Keep this
-// lower than heartbeat: a normal desktop start can request one token for the
-// remote-control host channel and another for the file-transfer host channel.
+// burst-friendly: a normal desktop start can request tokens for both the
+// remote-control host channel and the file-transfer host channel almost
+// simultaneously.
 func (s *RateLimitService) SignalTokenThrottle(ctx context.Context, deviceID string) (bool, error) {
-	return s.minInterval(ctx, fmt.Sprintf("qd:ratelimit:sigtok:%s", deviceID), 100*time.Millisecond)
+	count, _, err := s.incrWindow(ctx, fmt.Sprintf("qd:ratelimit:sigtok:%s", deviceID), 10*time.Second)
+	if err != nil {
+		return false, err
+	}
+	return count > 20, nil
 }
 
 // minInterval implements "at most one hit per TTL" using SETNX.

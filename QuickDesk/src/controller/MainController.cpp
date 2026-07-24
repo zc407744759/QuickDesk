@@ -1019,7 +1019,7 @@ void MainController::scheduleHostSignalingRecovery(const QString& reason)
         return;
     }
 
-    const int delayMs = m_hostSignalingRecoveryAttempt == 0 ? 1200 : 4000;
+    const int delayMs = qMin(60000, 5000 * (m_hostSignalingRecoveryAttempt + 1));
     LOG_WARN("Scheduling host signaling recovery in {} ms: state={} retryAttempt={}",
              delayMs, reason.toStdString(), m_hostSignalingRecoveryAttempt + 1);
     m_hostSignalingRecoveryTimer.start(delayMs);
@@ -1049,24 +1049,13 @@ void MainController::runHostSignalingRecovery()
         return;
     }
 
-    if (m_hostSignalingRecoveryAttempt <= 2) {
-        m_hostServerStatus = ServerStatus::Connecting;
-        emit hostServerStatusChanged();
-        m_hostManager->connectToServer(getDefaultServerUrl(),
-                                       savedAccessCodeForHostReconnect());
-        scheduleHostSignalingRecovery(QStringLiteral("connect_resent"));
-        return;
-    }
-
-    LOG_WARN("Host signaling did not recover after {} attempts; restarting host helper",
-             m_hostSignalingRecoveryAttempt);
-    m_hostSignalingRecoveryAttempt = 0;
-    m_processManager->stopHostProcess();
-    QTimer::singleShot(1200, this, [this]() {
-        if (!m_isShutdown) {
-            m_processManager->startHostProcess();
-        }
-    });
+    // The native host already owns a SignalingReconnectManager with backoff.
+    // Re-sending connect or restarting the helper while the process is alive
+    // creates overlapping token requests and can trip server-side 429 limits.
+    LOG_WARN("Host process is alive while signaling is {}; waiting for native "
+             "signaling backoff instead of restarting helper",
+             state.toStdString());
+    scheduleHostSignalingRecovery(QStringLiteral("native_backoff"));
 }
 
 void MainController::scheduleClientReconnect(const QString& deviceId,
