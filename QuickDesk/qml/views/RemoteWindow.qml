@@ -1282,12 +1282,425 @@ Window {
         }
     }
 
+    component FtpFilePane: Rectangle {
+        id: ftpPane
+        property string paneTitle: ""
+        property string paneSubtitle: ""
+        property string currentPath: ""
+        property var fileModel
+        property var selectedPaths: ({})
+        property bool remoteSide: false
+        signal pathAccepted(string path)
+        signal parentRequested()
+        signal homeRequested()
+        signal refreshRequested()
+        signal itemClicked(int index, string path, int modifiers)
+        signal itemDoubleClicked(int index, string path, bool isDir)
+
+        color: Theme.surfaceVariant
+        radius: Theme.radiusSmall
+        border.width: Theme.borderWidthThin
+        border.color: Theme.border
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: Theme.spacingSmall
+            spacing: Theme.spacingSmall
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+
+                Text {
+                    Layout.fillWidth: true
+                    text: ftpPane.paneTitle
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.DemiBold
+                    color: Theme.text
+                    elide: Text.ElideRight
+                }
+
+                Text {
+                    text: ftpPane.paneSubtitle
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.textSecondary
+                    elide: Text.ElideRight
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingXSmall
+
+                QDIconButton {
+                    iconSource: FluentIconGlyph.backGlyph
+                    buttonSize: QDIconButton.Size.Small
+                    buttonStyle: QDIconButton.Style.Standard
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Parent directory")
+                    onClicked: ftpPane.parentRequested()
+                }
+
+                QDIconButton {
+                    iconSource: FluentIconGlyph.homeGlyph
+                    buttonSize: QDIconButton.Size.Small
+                    buttonStyle: QDIconButton.Style.Standard
+                    visible: !ftpPane.remoteSide
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Home")
+                    onClicked: ftpPane.homeRequested()
+                }
+
+                QDIconButton {
+                    iconSource: FluentIconGlyph.syncGlyph
+                    buttonSize: QDIconButton.Size.Small
+                    buttonStyle: QDIconButton.Style.Standard
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Refresh")
+                    onClicked: ftpPane.refreshRequested()
+                }
+
+                QDTextField {
+                    id: pathField
+                    Layout.fillWidth: true
+                    text: ftpPane.currentPath
+                    prefixIcon: FluentIconGlyph.folderOpenGlyph
+                    font.pixelSize: Theme.fontSizeSmall
+                    selectByMouse: true
+                    onAccepted: ftpPane.pathAccepted(text)
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 30
+                color: Theme.surface
+                radius: Theme.radiusSmall
+                border.width: Theme.borderWidthThin
+                border.color: Theme.border
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Theme.spacingMedium
+                    anchors.rightMargin: Theme.spacingMedium
+                    spacing: Theme.spacingMedium
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: qsTr("Name")
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+
+                    Text {
+                        Layout.preferredWidth: 86
+                        text: qsTr("Size")
+                        horizontalAlignment: Text.AlignRight
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+
+                    Text {
+                        Layout.preferredWidth: 72
+                        text: qsTr("Type")
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+                }
+            }
+
+            ListView {
+                id: ftpListView
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                model: ftpPane.fileModel
+                clip: true
+                spacing: 1
+                boundsBehavior: Flickable.StopAtBounds
+
+                delegate: Rectangle {
+                    id: fileRow
+                    width: ftpListView.width
+                    height: 34
+                    radius: 2
+                    readonly property bool rowSelected: remoteWindow.pathSelected(ftpPane.selectedPaths, model.path)
+                    color: rowSelected ? Qt.rgba(0.0, 0.48, 1.0, 0.22)
+                        : (rowHover.hovered ? Theme.surfaceHover : "transparent")
+                    border.width: rowSelected ? Theme.borderWidthThin : 0
+                    border.color: Theme.primary
+
+                    HoverHandler { id: rowHover }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        acceptedButtons: Qt.LeftButton
+                        onClicked: function(mouse) {
+                            ftpPane.itemClicked(index, model.path, mouse.modifiers)
+                        }
+                        onDoubleClicked: {
+                            ftpPane.itemDoubleClicked(index, model.path, model.isDir)
+                        }
+                    }
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.spacingMedium
+                        anchors.rightMargin: Theme.spacingMedium
+                        spacing: Theme.spacingMedium
+
+                        Text {
+                            text: model.isDir ? FluentIconGlyph.folderGlyph : FluentIconGlyph.documentGlyph
+                            font.family: "Segoe Fluent Icons"
+                            font.pixelSize: Theme.iconSizeSmall
+                            color: model.isDir ? Theme.primary : Theme.textSecondary
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: model.name || model.filename
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.text
+                            elide: Text.ElideMiddle
+                        }
+
+                        Text {
+                            Layout.preferredWidth: 86
+                            text: model.isDir ? "" : remoteWindow.formatBytes(model.size)
+                            horizontalAlignment: Text.AlignRight
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.textSecondary
+                        }
+
+                        Text {
+                            Layout.preferredWidth: 72
+                            text: model.isDir ? qsTr("Folder") : qsTr("File")
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.textSecondary
+                            elide: Text.ElideRight
+                        }
+                    }
+                }
+            }
+
+            QDEmptyState {
+                visible: ftpPane.fileModel && ftpPane.fileModel.count === 0
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                iconSource: ftpPane.remoteSide ? FluentIconGlyph.syncFolderGlyph : FluentIconGlyph.folderOpenGlyph
+                title: ftpPane.remoteSide ? qsTr("Remote folder is empty") : qsTr("Local folder is empty")
+                description: ftpPane.remoteSide ? qsTr("Refresh or check the remote file channel") : qsTr("Choose another local directory")
+            }
+        }
+    }
+
+    component TransferQueuePanel: Rectangle {
+        id: queuePanel
+
+        color: Theme.surfaceVariant
+        radius: Theme.radiusSmall
+        border.width: Theme.borderWidthThin
+        border.color: Theme.border
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: Theme.spacingSmall
+            spacing: Theme.spacingSmall
+
+            RowLayout {
+                Layout.fillWidth: true
+
+                Text {
+                    Layout.fillWidth: true
+                    text: qsTr("Transfer Queue")
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.DemiBold
+                    color: Theme.text
+                }
+
+                Text {
+                    text: remoteWindow.activeTransferCount > 0
+                        ? qsTr("%1 active").arg(remoteWindow.activeTransferCount)
+                        : qsTr("%1 items").arg(transferModel.count)
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.textSecondary
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 26
+                color: Theme.surface
+                radius: Theme.radiusSmall
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Theme.spacingMedium
+                    anchors.rightMargin: Theme.spacingMedium
+                    spacing: Theme.spacingMedium
+
+                    Text {
+                        Layout.preferredWidth: 86
+                        text: qsTr("Direction")
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: qsTr("File")
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+
+                    Text {
+                        Layout.preferredWidth: 170
+                        text: qsTr("Progress")
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+
+                    Text {
+                        Layout.preferredWidth: 92
+                        text: qsTr("Speed")
+                        horizontalAlignment: Text.AlignRight
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+
+                    Text {
+                        Layout.preferredWidth: 92
+                        text: qsTr("Status")
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+                }
+            }
+
+            ListView {
+                id: queueListView
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                model: transferModel
+                clip: true
+                spacing: 1
+
+                delegate: Rectangle {
+                    width: queueListView.width
+                    height: 34
+                    radius: 2
+                    color: queueHover.hovered ? Theme.surfaceHover : "transparent"
+
+                    HoverHandler { id: queueHover }
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.spacingMedium
+                        anchors.rightMargin: Theme.spacingMedium
+                        spacing: Theme.spacingMedium
+
+                        Text {
+                            Layout.preferredWidth: 86
+                            text: model.direction === "download" ? qsTr("Remote -> Local") : qsTr("Local -> Remote")
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.text
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: model.filename
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: model.status === "error" ? Theme.error : Theme.text
+                            elide: Text.ElideMiddle
+                        }
+
+                        RowLayout {
+                            Layout.preferredWidth: 170
+                            spacing: Theme.spacingSmall
+
+                            QDProgressBar {
+                                Layout.fillWidth: true
+                                value: model.progress || 0
+                                progressColor: model.status === "error" ? Theme.error
+                                    : (model.status === "complete" ? Theme.success : Theme.primary)
+                            }
+
+                            Text {
+                                Layout.preferredWidth: 38
+                                text: Math.round((model.progress || 0) * 100) + "%"
+                                horizontalAlignment: Text.AlignRight
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.textSecondary
+                            }
+                        }
+
+                        Text {
+                            Layout.preferredWidth: 92
+                            text: model.status === "complete" ? "" : remoteWindow.formatSpeed(model.speedBytesPerSecond || 0)
+                            horizontalAlignment: Text.AlignRight
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.textSecondary
+                        }
+
+                        Text {
+                            Layout.preferredWidth: 92
+                            text: model.status === "error"
+                                ? qsTr("Failed")
+                                : (model.status === "complete" ? qsTr("Done") : qsTr("Transferring"))
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: model.status === "error" ? Theme.error
+                                : (model.status === "complete" ? Theme.success : Theme.textSecondary)
+                            elide: Text.ElideRight
+                        }
+                    }
+                }
+            }
+
+            QDEmptyState {
+                visible: transferModel.count === 0
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                iconSource: FluentIconGlyph.syncGlyph
+                title: qsTr("No transfers")
+                description: qsTr("Select files and copy them between panes")
+            }
+        }
+    }
+
     QDDialog {
         id: transferDialog
         title: qsTr("File Transfer") + (remoteWindow.activeTransferCount > 0
             ? " (" + remoteWindow.activeTransferCount + ")" : "")
-        dialogWidth: Math.min(remoteWindow.width - Theme.spacingXLarge * 2, 980)
-        dialogHeight: Math.min(remoteWindow.height - Theme.spacingXLarge * 2, 620)
+        dialogWidth: Math.min(remoteWindow.width - Theme.spacingXLarge * 2, 1120)
+        dialogHeight: Math.min(remoteWindow.height - Theme.spacingXLarge * 2, 720)
         closeOnOverlay: true
         onShowingChanged: {
             if (showing) {
@@ -1300,369 +1713,103 @@ Window {
             }
         }
 
-        RowLayout {
+        ColumnLayout {
             anchors.fill: parent
-            spacing: Theme.spacingMedium
+            spacing: Theme.spacingSmall
 
-            Rectangle {
+            RowLayout {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                Layout.minimumWidth: 300
-                color: Theme.surfaceVariant
-                radius: Theme.radiusMedium
-                border.width: Theme.borderWidthThin
-                border.color: Theme.border
+                spacing: Theme.spacingSmall
+
+                FtpFilePane {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumWidth: 360
+                    paneTitle: qsTr("Local site")
+                    paneSubtitle: remoteWindow.selectedLocalCount > 0
+                        ? qsTr("%1 selected").arg(remoteWindow.selectedLocalCount)
+                        : qsTr("%1 items").arg(localFileModel.count)
+                    currentPath: remoteWindow.localCurrentPath
+                    fileModel: localFileModel
+                    selectedPaths: remoteWindow.selectedLocalPaths
+                    remoteSide: false
+                    onPathAccepted: function(path) { remoteWindow.refreshLocalDirectory(path) }
+                    onParentRequested: remoteWindow.refreshLocalDirectory(
+                        mainController.ftpManager.parentDirectory(remoteWindow.localCurrentPath))
+                    onHomeRequested: remoteWindow.refreshLocalDirectory(mainController.ftpManager.homeDirectory())
+                    onRefreshRequested: remoteWindow.refreshLocalDirectory(remoteWindow.localCurrentPath)
+                    onItemClicked: function(index, path, modifiers) {
+                        remoteWindow.handleLocalSelection(index, path, modifiers)
+                    }
+                    onItemDoubleClicked: function(index, path, isDir) {
+                        remoteWindow.selectOnly("local", index, path)
+                        if (isDir) remoteWindow.refreshLocalDirectory(path)
+                        else remoteWindow.uploadSelectedLocalFile()
+                    }
+                }
 
                 ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: Theme.spacingMedium
-                    spacing: Theme.spacingMedium
+                    Layout.preferredWidth: 56
+                    Layout.fillHeight: true
+                    spacing: Theme.spacingSmall
 
-                    RowLayout {
-                        Layout.fillWidth: true
+                    Item { Layout.fillHeight: true }
 
-                        Text {
-                            Layout.fillWidth: true
-                            text: qsTr("Controller Files")
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fontSizeLarge
-                            font.weight: Font.DemiBold
-                            color: Theme.text
-                        }
-
-                        QDButton {
-                            text: qsTr("Up")
-                            iconText: FluentIconGlyph.backGlyph
-                            buttonType: QDButton.Type.Secondary
-                            onClicked: remoteWindow.refreshLocalDirectory(
-                                mainController.ftpManager.parentDirectory(remoteWindow.localCurrentPath))
-                        }
-
-                        QDButton {
-                            text: qsTr("Home")
-                            buttonType: QDButton.Type.Secondary
-                            onClicked: remoteWindow.refreshLocalDirectory(mainController.ftpManager.homeDirectory())
-                        }
+                    QDIconButton {
+                        iconSource: FluentIconGlyph.forwardGlyph
+                        buttonSize: QDIconButton.Size.Large
+                        buttonStyle: QDIconButton.Style.Accent
+                        enabled: remoteWindow.hasSelectedLocalFiles()
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("Upload selected files")
+                        onClicked: remoteWindow.uploadSelectedLocalFile()
                     }
 
-                    Text {
-                        Layout.fillWidth: true
-                        text: remoteWindow.localCurrentPath
-                        font.family: Theme.fontFamily
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.textSecondary
-                        elide: Text.ElideMiddle
+                    QDIconButton {
+                        iconSource: FluentIconGlyph.backGlyph
+                        buttonSize: QDIconButton.Size.Large
+                        buttonStyle: QDIconButton.Style.Standard
+                        enabled: remoteWindow.hasSelectedRemoteFiles()
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("Download selected files")
+                        onClicked: remoteWindow.startRemoteDownload()
                     }
 
-                    ListView {
-                        id: localFileListView
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        visible: localFileModel.count > 0
-                        model: localFileModel
-                        clip: true
-                        spacing: 2
+                    Item { Layout.fillHeight: true }
+                }
 
-                        delegate: Rectangle {
-                            width: localFileListView.width
-                            height: 44
-                            radius: Theme.radiusSmall
-                            color: remoteWindow.pathSelected(remoteWindow.selectedLocalPaths, model.path)
-                                ? Theme.surfacePressed
-                                : (localHover.hovered ? Theme.surfaceHover : "transparent")
-                            border.width: remoteWindow.pathSelected(remoteWindow.selectedLocalPaths, model.path)
-                                ? Theme.borderWidthThin : 0
-                            border.color: Theme.primary
-
-                            HoverHandler { id: localHover }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: function(mouse) {
-                                    remoteWindow.handleLocalSelection(index, model.path, mouse.modifiers)
-                                }
-                                onDoubleClicked: {
-                                    remoteWindow.selectOnly("local", index, model.path)
-                                    if (model.isDir) remoteWindow.refreshLocalDirectory(model.path)
-                                }
-                            }
-
-                            RowLayout {
-                                anchors.fill: parent
-                                anchors.leftMargin: Theme.spacingMedium
-                                anchors.rightMargin: Theme.spacingSmall
-                                spacing: Theme.spacingSmall
-
-                                Text {
-                                    text: model.isDir ? FluentIconGlyph.folderGlyph : FluentIconGlyph.documentGlyph
-                                    font.family: "Segoe Fluent Icons"
-                                    font.pixelSize: Theme.iconSizeMedium
-                                    color: Theme.primary
-                                }
-
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: model.filename
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSizeMedium
-                                    color: Theme.text
-                                    elide: Text.ElideMiddle
-                                }
-                            }
-                        }
+                FtpFilePane {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumWidth: 360
+                    paneTitle: qsTr("Remote site")
+                    paneSubtitle: remoteWindow.selectedRemoteCount > 0
+                        ? qsTr("%1 selected").arg(remoteWindow.selectedRemoteCount)
+                        : qsTr("%1 items").arg(remoteFileModel.count)
+                    currentPath: remoteWindow.remoteCurrentPath
+                    fileModel: remoteFileModel
+                    selectedPaths: remoteWindow.selectedRemotePaths
+                    remoteSide: true
+                    onPathAccepted: function(path) { remoteWindow.refreshRemoteDirectory(path) }
+                    onParentRequested: remoteWindow.refreshRemoteDirectory(
+                        mainController.ftpManager.parentDirectory(remoteWindow.remoteCurrentPath))
+                    onRefreshRequested: remoteWindow.refreshRemoteDirectory(remoteWindow.remoteCurrentPath)
+                    onItemClicked: function(index, path, modifiers) {
+                        remoteWindow.handleRemoteSelection(index, path, modifiers)
                     }
-
-                    QDEmptyState {
-                        visible: localFileModel.count === 0
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        iconSource: FluentIconGlyph.folderOpenGlyph
-                        title: qsTr("No Local Files")
-                        description: qsTr("This folder is empty")
+                    onItemDoubleClicked: function(index, path, isDir) {
+                        remoteWindow.selectOnly("remote", index, path)
+                        if (isDir) remoteWindow.refreshRemoteDirectory(path)
+                        else remoteWindow.startRemoteDownload()
                     }
                 }
             }
 
-            ColumnLayout {
-                Layout.preferredWidth: 72
-                Layout.fillHeight: true
-                spacing: Theme.spacingMedium
-
-                Item { Layout.fillHeight: true }
-
-                QDIconButton {
-                    iconSource: FluentIconGlyph.forwardGlyph
-                    buttonSize: QDIconButton.Size.Large
-                    buttonStyle: QDIconButton.Style.Accent
-                    enabled: remoteWindow.hasSelectedLocalFiles()
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Copy to remote")
-                    onClicked: remoteWindow.uploadSelectedLocalFile()
-                }
-
-                QDIconButton {
-                    iconSource: FluentIconGlyph.backGlyph
-                    buttonSize: QDIconButton.Size.Large
-                    buttonStyle: QDIconButton.Style.Standard
-                    ToolTip.visible: hovered
-                    enabled: remoteWindow.hasSelectedRemoteFiles()
-                    ToolTip.text: qsTr("Copy from remote")
-                    onClicked: remoteWindow.startRemoteDownload()
-                }
-
-                Item { Layout.fillHeight: true }
-            }
-
-            Rectangle {
+            TransferQueuePanel {
                 Layout.fillWidth: true
-                Layout.fillHeight: true
-                Layout.minimumWidth: 300
-                color: Theme.surfaceVariant
-                radius: Theme.radiusMedium
-                border.width: Theme.borderWidthThin
-                border.color: Theme.border
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: Theme.spacingMedium
-                    spacing: Theme.spacingMedium
-
-                    RowLayout {
-                        Layout.fillWidth: true
-
-                        Text {
-                            Layout.fillWidth: true
-                            text: qsTr("Remote Files")
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fontSizeLarge
-                            font.weight: Font.DemiBold
-                            color: Theme.text
-                        }
-
-                        QDButton {
-                            text: qsTr("Up")
-                            iconText: FluentIconGlyph.backGlyph
-                            buttonType: QDButton.Type.Secondary
-                            onClicked: remoteWindow.refreshRemoteDirectory(
-                                mainController.ftpManager.parentDirectory(remoteWindow.remoteCurrentPath))
-                        }
-
-                        QDButton {
-                            text: qsTr("Refresh")
-                            iconText: FluentIconGlyph.syncGlyph
-                            buttonType: QDButton.Type.Secondary
-                            onClicked: remoteWindow.refreshRemoteDirectory(remoteWindow.remoteCurrentPath)
-                        }
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        text: remoteWindow.remoteCurrentPath
-                        font.family: Theme.fontFamily
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.textSecondary
-                        elide: Text.ElideMiddle
-                    }
-
-                    ListView {
-                        id: remoteTransferListView
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        visible: remoteFileModel.count > 0
-                        model: remoteFileModel
-                        clip: true
-                        spacing: 2
-
-                        delegate: Rectangle {
-                            width: remoteTransferListView.width
-                            height: 44
-                            color: remoteWindow.pathSelected(remoteWindow.selectedRemotePaths, model.path)
-                                ? Theme.surfacePressed
-                                : (transferHover.hovered ? Theme.surfaceHover : "transparent")
-                            radius: Theme.radiusSmall
-                            border.width: remoteWindow.pathSelected(remoteWindow.selectedRemotePaths, model.path)
-                                ? Theme.borderWidthThin : 0
-                            border.color: Theme.primary
-
-                            HoverHandler { id: transferHover }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: function(mouse) {
-                                    remoteWindow.handleRemoteSelection(index, model.path, mouse.modifiers)
-                                }
-                                onDoubleClicked: {
-                                    remoteWindow.selectOnly("remote", index, model.path)
-                                    if (model.isDir) remoteWindow.refreshRemoteDirectory(model.path)
-                                    else remoteWindow.startRemoteDownload()
-                                }
-                            }
-
-                            RowLayout {
-                                id: transferItemLayout
-                                anchors.fill: parent
-                                anchors.margins: Theme.spacingMedium
-                                spacing: Theme.spacingSmall
-
-                                    Text {
-                                        text: model.isDir ? FluentIconGlyph.folderGlyph : FluentIconGlyph.documentGlyph
-                                        font.family: "Segoe Fluent Icons"
-                                        font.pixelSize: Theme.iconSizeMedium
-                                        color: Theme.primary
-                                    }
-
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: model.name
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSizeMedium
-                                        color: Theme.text
-                                        elide: Text.ElideMiddle
-                                    }
-
-                                    Text {
-                                        visible: !model.isDir
-                                        text: remoteWindow.formatBytes(model.size)
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.textSecondary
-                                    }
-                            }
-                        }
-                    }
-
-                    QDEmptyState {
-                        visible: remoteFileModel.count === 0
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        iconSource: FluentIconGlyph.syncFolderGlyph
-                        title: qsTr("No Remote Files")
-                        description: qsTr("Remote folder is empty or not loaded")
-                    }
-
-                    Rectangle {
-                        visible: transferModel.count > 0
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: Math.min(150, 48 + transferQueueView.contentHeight)
-                        color: Theme.surface
-                        radius: Theme.radiusSmall
-                        border.width: Theme.borderWidthThin
-                        border.color: Theme.border
-
-                        ColumnLayout {
-                            anchors.fill: parent
-                            anchors.margins: Theme.spacingSmall
-                            spacing: Theme.spacingSmall
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: qsTr("Transfers")
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSizeSmall
-                                font.weight: Font.DemiBold
-                                color: Theme.textSecondary
-                            }
-
-                            ListView {
-                                id: transferQueueView
-                                Layout.fillWidth: true
-                                Layout.fillHeight: true
-                                model: transferModel
-                                clip: true
-                                spacing: Theme.spacingSmall
-
-                                delegate: ColumnLayout {
-                                    width: transferQueueView.width
-                                    spacing: 4
-
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: Theme.spacingSmall
-
-                                        Text {
-                                            Layout.fillWidth: true
-                                            text: (model.direction === "download" ? qsTr("Download") : qsTr("Upload"))
-                                                + " · " + model.filename
-                                            font.family: Theme.fontFamily
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            color: model.status === "error" ? Theme.error : Theme.text
-                                            elide: Text.ElideMiddle
-                                        }
-
-                                        Text {
-                                            text: Math.round((model.progress || 0) * 100) + "%"
-                                            font.family: Theme.fontFamily
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            color: Theme.textSecondary
-                                        }
-                                    }
-
-                                    QDProgressBar {
-                                        Layout.fillWidth: true
-                                        value: model.progress || 0
-                                        progressColor: model.status === "error" ? Theme.error
-                                            : (model.status === "complete" ? Theme.success : Theme.primary)
-                                    }
-
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: model.status === "error"
-                                            ? model.errorMessage
-                                            : remoteWindow.formatBytes(model.transferredBytes || 0)
-                                                + " / " + remoteWindow.formatBytes(model.totalBytes || 0)
-                                                + " · " + (model.status === "complete"
-                                                    ? qsTr("Done")
-                                                    : remoteWindow.formatSpeed(model.speedBytesPerSecond || 0))
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.textSecondary
-                                        elide: Text.ElideRight
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                Layout.preferredHeight: 170
+                Layout.minimumHeight: 132
             }
         }
     }
