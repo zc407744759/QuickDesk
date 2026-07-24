@@ -192,14 +192,13 @@ Window {
         
         console.log("Closing connection:", tabDeviceId, "at index:", index, "needDisconnect:", needDisconnect)
         
-        // 1. Remove the tab first (before disconnect to avoid re-entrant state change handler)
-        removeConnection(index)
-        
-        // 2. Only call disconnectFromHost when the caller is initiating the disconnect
-        //    (skip if we're reacting to a connectionStateChanged/connectionRemoved signal)
+        // Send the disconnect before removing the last tab. removeConnection()
+        // can close this window, which makes post-cleanup disconnects unreliable.
         if (needDisconnect && clientManager) {
             clientManager.disconnectFromHost(tabDeviceId)
         }
+
+        removeConnection(index)
         
         delete closingConnections[tabDeviceId]
     }
@@ -234,11 +233,14 @@ Window {
     // Clean up all connections when window closes
     onClosing: function(close) {
         console.log("RemoteWindow closing, disconnecting all connections")
+        var deviceIds = []
         for (var i = 0; i < connectionModel.count; i++) {
-            if (clientManager) {
-                console.log("Disconnecting:", connectionModel.deviceIdAt(i))
-                clientManager.disconnectFromHost(connectionModel.deviceIdAt(i))
-            }
+            deviceIds.push(connectionModel.deviceIdAt(i))
+        }
+        for (var j = 0; j < deviceIds.length; j++) {
+            if (!clientManager) continue
+            console.log("Disconnecting:", deviceIds[j])
+            clientManager.disconnectFromHost(deviceIds[j])
         }
         connectionModel.clear()
     }

@@ -221,17 +221,35 @@ QString ClientManager::connectToHost(const QString& deviceId,
 
 void ClientManager::disconnectFromHost(const QString& deviceId)
 {
-    if (!m_messaging || !m_messaging->isReady()) {
+    QString connId = connectionIdFor(deviceId);
+    if (connId.isEmpty()) {
+        if (m_connections.contains(deviceId)) {
+            m_sharedMemoryManager->detach(deviceId);
+            removeConnection(deviceId);
+            emit connectionCountChanged();
+            emit connectionRemoved(deviceId);
+            emit connectionListChanged();
+        }
         return;
     }
 
-    QString connId = connectionIdFor(deviceId);
-    if (connId.isEmpty()) return;
+    if (m_messaging && m_messaging->isReady()) {
+        QJsonObject audio;
+        audio["type"] = "setAudioEnabled";
+        audio["connectionId"] = connId;
+        audio["enabled"] = false;
+        m_messaging->sendMessage(audio);
 
-    QJsonObject message;
-    message["type"] = "disconnectFromHost";
-    message["connectionId"] = connId;
-    m_messaging->sendMessage(message);
+        QJsonObject message;
+        message["type"] = "disconnectFromHost";
+        message["connectionId"] = connId;
+        m_messaging->sendMessage(message);
+        LOG_INFO("Disconnect requested: device={} connectionId={}",
+                 deviceId.toStdString(), connId.toStdString());
+    } else {
+        LOG_WARN("Disconnect local cleanup only: client messaging not ready, device={} connectionId={}",
+                 deviceId.toStdString(), connId.toStdString());
+    }
 
     if (m_connections.contains(deviceId)) {
         m_connections[deviceId].rtcState = RtcStatus::Disconnected;
@@ -257,13 +275,26 @@ void ClientManager::disconnectFromHost(const QString& deviceId)
 
 void ClientManager::disconnectAll()
 {
-    if (!m_messaging || !m_messaging->isReady()) {
-        return;
-    }
+    if (m_messaging && m_messaging->isReady()) {
+        const QStringList deviceIds = m_connections.keys();
+        for (const auto& devId : deviceIds) {
+            const QString connId = connectionIdFor(devId);
+            if (connId.isEmpty()) continue;
+            QJsonObject audio;
+            audio["type"] = "setAudioEnabled";
+            audio["connectionId"] = connId;
+            audio["enabled"] = false;
+            m_messaging->sendMessage(audio);
+        }
 
-    QJsonObject message;
-    message["type"] = "disconnectAll";
-    m_messaging->sendMessage(message);
+        QJsonObject message;
+        message["type"] = "disconnectAll";
+        m_messaging->sendMessage(message);
+        LOG_INFO("Disconnect all requested: count={}", m_connections.size());
+    } else {
+        LOG_WARN("Disconnect all local cleanup only: client messaging not ready, count={}",
+                 m_connections.size());
+    }
 
     QStringList deviceIds = m_connections.keys();
     for (const auto& devId : deviceIds) {

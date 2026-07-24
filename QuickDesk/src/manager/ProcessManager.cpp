@@ -863,7 +863,7 @@ void ProcessManager::connectToHostServiceAsync()
             startHostAsChildProcess();
         });
 
-    m_pipeConnectTimer.start(5000);
+    m_pipeConnectTimer.start(1200);
     m_hostWriteSocket->connectToServer(writePipeName, QIODevice::WriteOnly);
 #endif
 }
@@ -895,17 +895,17 @@ void ProcessManager::onServicePipeError()
     // back to child process. The worker may be restarting after a clean exit.
     if (isHostServiceRunning()) {
         m_hostRestartCount++;
-        if (m_hostRestartCount <= MAX_RESTART_ATTEMPTS) {
+        if (m_hostRestartCount <= MAX_SERVICE_PIPE_START_ATTEMPTS) {
             int delay = calculateRestartDelay(m_hostRestartCount);
             setHostProcessStatus(ProcessStatus::Restarting);
             LOG_INFO("Service pipe not ready, retrying in {} ms (attempt {} of {})",
-                     delay, m_hostRestartCount, MAX_RESTART_ATTEMPTS);
-            emit hostProcessRestarting(m_hostRestartCount, MAX_RESTART_ATTEMPTS);
+                     delay, m_hostRestartCount, MAX_SERVICE_PIPE_START_ATTEMPTS);
+            emit hostProcessRestarting(m_hostRestartCount, MAX_SERVICE_PIPE_START_ATTEMPTS);
             m_hostRestartTimer.start(delay);
             return;
         }
         LOG_WARN("Service pipe unavailable after {} retries, falling back to "
-                 "child process", MAX_RESTART_ATTEMPTS);
+                 "child process", MAX_SERVICE_PIPE_START_ATTEMPTS);
     } else {
         LOG_INFO("Service not running, starting as child process");
     }

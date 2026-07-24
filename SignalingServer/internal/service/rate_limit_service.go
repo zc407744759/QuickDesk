@@ -203,10 +203,11 @@ func (s *RateLimitService) HeartbeatThrottle(ctx context.Context, deviceID strin
 	return s.minInterval(ctx, fmt.Sprintf("qd:ratelimit:hb:%s", deviceID), time.Second)
 }
 
-// SignalTokenThrottle mirrors HeartbeatThrottle for
-// POST /v1/devices/:id/signal-tokens.
+// SignalTokenThrottle protects POST /v1/devices/:id/signal-tokens. Keep this
+// lower than heartbeat: a normal desktop start can request one token for the
+// remote-control host channel and another for the file-transfer host channel.
 func (s *RateLimitService) SignalTokenThrottle(ctx context.Context, deviceID string) (bool, error) {
-	return s.minInterval(ctx, fmt.Sprintf("qd:ratelimit:sigtok:%s", deviceID), time.Second)
+	return s.minInterval(ctx, fmt.Sprintf("qd:ratelimit:sigtok:%s", deviceID), 100*time.Millisecond)
 }
 
 // minInterval implements "at most one hit per TTL" using SETNX.

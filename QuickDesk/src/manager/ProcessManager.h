@@ -126,6 +126,7 @@ private:
     bool m_hostAutoRestart = true;
     bool m_clientAutoRestart = true;
     static constexpr int MAX_RESTART_ATTEMPTS = 5;
+    static constexpr int MAX_SERVICE_PIPE_START_ATTEMPTS = 2;
     static const int BASE_RESTART_DELAY_MS = 500; // fast first retry
 
     // Host restart state
